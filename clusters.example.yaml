@@ -29,8 +29,8 @@
 - id: recording-health-check-not-wired
   title: "Built health-check script never actually invoked by the watchdog"
   status: fix-applied
-  first_seen: 2026-07-11
-  last_seen: 2026-07-20
+  first_seen: 2026-05-03
+  last_seen: 2026-05-12
   sessions: 3
   projects: [photo-tagger]
   evidence: [agent-701a7b5f270123cad, 1838b72b]
@@ -40,10 +40,10 @@
 - id: background-task-opacity
   title: "Long unattended runs give no progress signal, user asks 'is it stuck?'"
   status: monitor
-  first_seen: 2026-06-30
-  last_seen: 2026-07-20
+  first_seen: 2026-04-22
+  last_seen: 2026-05-12
   sessions: 9
   projects: [photo-tagger, recipe-box, garden-planner, weather-widget]
   evidence: [d13e3a2d, 0e7d8cea, 8f8d9dcb, 7412b54a]
-  fix: "CLAUDE.md heartbeat rule (2026-07-11), extended to external CLI timeout+liveness and verbatim-in-subagent-prompts (2026-07-20)"
+  fix: "CLAUDE.md heartbeat rule (2026-04-22), extended to external CLI timeout+liveness and verbatim-in-subagent-prompts (2026-05-12)"
   wired_check: "next window's digests contain zero 'is it stuck'/'is the shell stuck' user messages and no background run silent for >10 min"
