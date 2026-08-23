@@ -82,11 +82,28 @@ def _runtime_spec(runtime: Runtime, home: Path, env: Mapping[str, str], source_r
     if runtime is Runtime.CLAUDE:
         base = home / ".claude"
         skill_root = base / "skills" / "reflect-setup"
-        inventory_roots = (base / "skills", base / "commands", base / "agents", base / "settings.json")
+        inventory_roots = (
+            base / "skills",
+            base / "commands",
+            base / "agents",
+            base / "settings.json",
+            base / "settings.local.json",
+            Path(".claude/skills"),
+            Path(".claude/commands"),
+            Path(".claude/agents"),
+            Path(".claude/settings.json"),
+            Path(".claude/settings.local.json"),
+        )
     else:
         base = home / ".codex"
         skill_root = base / "skills" / "reflect-setup"
-        inventory_roots = (base / "skills", base / "agents", base / "config.toml")
+        inventory_roots = (
+            base / "skills",
+            base / "agents",
+            base / "config.toml",
+            Path(".codex/skills"),
+            Path(".codex/agents"),
+        )
     return RuntimeSpec(runtime, home, Path(root), skill_root, inventory_roots)
 
 
@@ -199,44 +216,77 @@ def discover_sessions(spec: RuntimeSpec, scope: Scope) -> tuple[SessionRef, ...]
     return tuple(sorted(sessions, key=lambda item: (item.runtime.value, item.project, item.relative_path)))
 
 
-def _file_hash(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _source_files(source_root: Path) -> tuple[tuple[str, Path, str], ...]:
-    files: list[tuple[str, Path, str]] = []
+def _source_files(source_root: Path) -> tuple[tuple[str, Path, bytes], ...]:
+    files: list[tuple[str, Path, bytes]] = []
     for path in source_root.rglob("*"):
         if not path.is_file():
             continue
         relative = path.relative_to(source_root).as_posix()
-        files.append((relative, path, _file_hash(path)))
+        files.append((relative, path, path.read_bytes()))
     return tuple(sorted(files, key=lambda item: item[0]))
 
 
-def _source_hash(files: tuple[tuple[str, Path, str], ...]) -> str:
+def _source_hash(files: tuple[tuple[str, Path, bytes], ...]) -> str:
     digest = hashlib.sha256()
-    for relative, path, unused_file_hash in files:
-        del unused_file_hash
+    for relative, unused_path, file_bytes in files:
         digest.update(relative.encode("utf-8"))
         digest.update(b"\0")
-        with path.open("rb") as stream:
-            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(chunk)
+        digest.update(file_bytes)
         digest.update(b"\0")
     return digest.hexdigest()
 
 
-def _manifest(source_root: Path, spec: RuntimeSpec, source_hash: str, files: tuple[tuple[str, Path, str], ...]) -> dict[str, object]:
+def _source_commit(source_root: Path) -> str | None:
+    git_marker = source_root / ".git"
+    if git_marker.is_dir():
+        git_dir = git_marker
+    elif git_marker.is_file():
+        try:
+            marker = git_marker.read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        if not marker.startswith("gitdir:"):
+            return None
+        git_dir = Path(marker.split(":", 1)[1].strip())
+        if not git_dir.is_absolute():
+            git_dir = source_root / git_dir
+    else:
+        return None
+
+    try:
+        head = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not head:
+        return None
+    if not head.startswith("ref: "):
+        return head
+    ref = head[5:].strip()
+    try:
+        return (git_dir / ref).read_text(encoding="utf-8").strip() or None
+    except OSError:
+        try:
+            packed = (git_dir / "packed-refs").read_text(encoding="utf-8")
+        except OSError:
+            return None
+        for line in packed.splitlines():
+            if line and not line.startswith("#"):
+                commit, packed_ref = line.split(" ", 1)
+                if packed_ref == ref:
+                    return commit
+    return None
+
+
+def _manifest(source_root: Path, spec: RuntimeSpec, source_hash: str, files: tuple[tuple[str, Path, bytes], ...]) -> dict[str, object]:
     return {
-        "source_commit": None,
+        "source_commit": _source_commit(source_root),
         "source_path": str(source_root.resolve()),
         "runtime": spec.runtime.value,
         "source_hash": source_hash,
-        "files": {relative: file_hash for relative, unused_path, file_hash in files},
+        "files": {
+            relative: hashlib.sha256(file_bytes).hexdigest()
+            for relative, unused_path, file_bytes in files
+        },
     }
 
 
@@ -282,6 +332,8 @@ def install_skill(
         raise _collision(target, "source/installed mismatch (different symlink)")
     if target.exists():
         if mode == "copy":
+            if not target.is_dir():
+                raise _collision(target, "existing file")
             installed = _existing_manifest(target)
             if installed is not None and installed.get("source_hash") == source_hash:
                 return InstallResult(spec.runtime, mode, target, source_hash)

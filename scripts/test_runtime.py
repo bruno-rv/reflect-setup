@@ -26,6 +26,37 @@ def test_source_root_override_changes_only_session_root():
         assert spec.skill_root == home / ".claude" / "skills" / "reflect-setup"
 
 
+def test_claude_inventory_includes_global_and_project_locations():
+    with TemporaryDirectory() as raw:
+        home = Path(raw)
+        spec = resolve_runtime("claude", home=home, env={})
+        assert set(spec.inventory_roots) == {
+            home / ".claude" / "skills",
+            home / ".claude" / "commands",
+            home / ".claude" / "agents",
+            home / ".claude" / "settings.json",
+            home / ".claude" / "settings.local.json",
+            Path(".claude/skills"),
+            Path(".claude/commands"),
+            Path(".claude/agents"),
+            Path(".claude/settings.json"),
+            Path(".claude/settings.local.json"),
+        }
+
+
+def test_codex_inventory_includes_global_and_project_locations():
+    with TemporaryDirectory() as raw:
+        home = Path(raw)
+        spec = resolve_runtime("codex", home=home, env={})
+        assert set(spec.inventory_roots) == {
+            home / ".codex" / "skills",
+            home / ".codex" / "agents",
+            home / ".codex" / "config.toml",
+            Path(".codex/skills"),
+            Path(".codex/agents"),
+        }
+
+
 def test_auto_runtime_rejects_ambiguous_existing_roots():
     with TemporaryDirectory() as raw:
         home = Path(raw)

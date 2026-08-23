@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+import runtime
 from runtime import Runtime, install_skill, resolve_runtime
 
 
@@ -46,6 +47,23 @@ def test_install_refuses_unmanaged_existing_directory():
         assert (spec.skill_root / "user-file.md").read_text() == "keep me\n"
 
 
+def test_copy_install_refuses_existing_regular_file():
+    with TemporaryDirectory() as raw:
+        home = Path(raw) / "home"
+        source = Path(raw) / "repo"
+        _source_tree(source)
+        spec = resolve_runtime("codex", home=home, env={})
+        spec.skill_root.parent.mkdir(parents=True)
+        spec.skill_root.write_text("keep this file\n")
+        try:
+            install_skill(spec, source, mode="copy")
+        except FileExistsError as exc:
+            assert "existing file" in str(exc)
+        else:
+            raise AssertionError("existing regular file must not be replaced")
+        assert spec.skill_root.read_text() == "keep this file\n"
+
+
 def test_install_refuses_different_existing_symlink():
     with TemporaryDirectory() as raw:
         home = Path(raw) / "home"
@@ -82,6 +100,21 @@ def test_copy_install_writes_manifest_and_is_idempotent():
         assert manifest["runtime"] == "codex"
 
 
+def test_copy_install_records_source_commit_provenance():
+    with TemporaryDirectory() as raw:
+        home = Path(raw) / "home"
+        source = Path(raw) / "repo"
+        _source_tree(source)
+        git_dir = source / ".git"
+        (git_dir / "refs" / "heads").mkdir(parents=True)
+        (git_dir / "HEAD").write_text("ref: refs/heads/main\n")
+        (git_dir / "refs" / "heads" / "main").write_text("abc123def456\n")
+        spec = resolve_runtime("claude", home=home, env={})
+        install_skill(spec, source, mode="copy")
+        manifest = json.loads((spec.skill_root / ".reflect-setup-source.json").read_text())
+        assert manifest["source_commit"] == "abc123def456"
+
+
 def test_copy_install_refuses_different_manifest_hash_without_overwriting():
     with TemporaryDirectory() as raw:
         home = Path(raw) / "home"
@@ -112,6 +145,16 @@ def test_source_hash_is_order_independent_and_changes_with_file_bytes():
         (source / "SKILL.md").write_text("# changed\n")
         second = install_skill(resolve_runtime("codex", home=Path(raw) / "other-home", env={}), source, mode="copy")
         assert first.source_hash != second.source_hash
+
+
+def test_source_hash_uses_one_consistent_file_snapshot():
+    with TemporaryDirectory() as raw:
+        source = Path(raw) / "repo"
+        _source_tree(source)
+        files = runtime._source_files(source)
+        before = runtime._source_hash(files)
+        (source / "SKILL.md").write_text("# changed after scan\n")
+        assert runtime._source_hash(files) == before
 
 
 def test_install_rejects_non_directory_source():
