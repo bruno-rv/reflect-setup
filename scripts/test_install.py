@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Runnable checks for safe source installation."""
 import json
+import shutil
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -115,6 +116,25 @@ def test_copy_install_records_source_commit_provenance():
         assert manifest["source_commit"] == "abc123def456"
 
 
+def test_copy_install_records_linked_worktree_source_commit():
+    with TemporaryDirectory() as raw:
+        home = Path(raw) / "home"
+        source = Path(raw) / "repo"
+        _source_tree(source)
+        linked_git = Path(raw) / "repo-git" / "worktrees" / "fixture"
+        common_git = Path(raw) / "repo-git"
+        (linked_git / "refs").mkdir(parents=True)
+        (common_git / "refs" / "heads").mkdir(parents=True)
+        (source / ".git").write_text("gitdir: ../repo-git/worktrees/fixture\n")
+        (linked_git / "commondir").write_text("../..\n")
+        (linked_git / "HEAD").write_text("ref: refs/heads/main\n")
+        (common_git / "refs" / "heads" / "main").write_text("linked123commit\n")
+        spec = resolve_runtime("claude", home=home, env={})
+        install_skill(spec, source, mode="copy")
+        manifest = json.loads((spec.skill_root / ".reflect-setup-source.json").read_text())
+        assert manifest["source_commit"] == "linked123commit"
+
+
 def test_copy_install_refuses_different_manifest_hash_without_overwriting():
     with TemporaryDirectory() as raw:
         home = Path(raw) / "home"
@@ -155,6 +175,49 @@ def test_source_hash_uses_one_consistent_file_snapshot():
         before = runtime._source_hash(files)
         (source / "SKILL.md").write_text("# changed after scan\n")
         assert runtime._source_hash(files) == before
+
+
+def test_source_snapshot_keeps_hash_and_metadata_without_file_contents():
+    with TemporaryDirectory() as raw:
+        source = Path(raw) / "repo"
+        _source_tree(source)
+        snapshot = runtime._source_files(source)
+        skill = next(item for item in snapshot.files if item.relative == "SKILL.md")
+        assert skill.sha256 == "9a429201baa3479a6fadef8b7b42e20298f305a8d0760eb5e7846e45e6134747"
+        assert skill.size == len("# reflect-setup\n".encode("utf-8"))
+        assert not hasattr(skill, "file_bytes")
+
+
+def test_copy_verification_rejects_source_mutation_after_snapshot():
+    with TemporaryDirectory() as raw:
+        source = Path(raw) / "repo"
+        staging = Path(raw) / "staging"
+        _source_tree(source)
+        snapshot = runtime._source_files(source)
+        shutil.copytree(source, staging, symlinks=True)
+        (source / "SKILL.md").write_text("# changed during copy\n")
+        try:
+            runtime._verify_snapshot_copy(source, staging, snapshot)
+        except RuntimeError as exc:
+            assert "changed" in str(exc)
+        else:
+            raise AssertionError("source mutation must fail copy verification")
+
+
+def test_copy_verification_rejects_tampered_staging_bytes():
+    with TemporaryDirectory() as raw:
+        source = Path(raw) / "repo"
+        staging = Path(raw) / "staging"
+        _source_tree(source)
+        snapshot = runtime._source_files(source)
+        shutil.copytree(source, staging, symlinks=True)
+        (staging / "SKILL.md").write_text("# tampered staging\n")
+        try:
+            runtime._verify_snapshot_copy(source, staging, snapshot)
+        except RuntimeError as exc:
+            assert "diverged" in str(exc)
+        else:
+            raise AssertionError("tampered staging bytes must fail verification")
 
 
 def test_install_rejects_non_directory_source():

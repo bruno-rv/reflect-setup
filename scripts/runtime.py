@@ -60,6 +60,24 @@ class InstallResult:
     source_hash: str
 
 
+@_frozen_dataclass
+class _SourceFile:
+    relative: str
+    path: Path
+    sha256: str
+    size: int
+    mtime_ns: int
+
+
+@_frozen_dataclass
+class _SourceSnapshot:
+    files: tuple[_SourceFile, ...]
+    source_hash: str
+
+    def __iter__(self):
+        return iter(self.files)
+
+
 def _runtime_from_name(name: str) -> Runtime:
     try:
         return Runtime(name.lower())
@@ -216,24 +234,43 @@ def discover_sessions(spec: RuntimeSpec, scope: Scope) -> tuple[SessionRef, ...]
     return tuple(sorted(sessions, key=lambda item: (item.runtime.value, item.project, item.relative_path)))
 
 
-def _source_files(source_root: Path) -> tuple[tuple[str, Path, bytes], ...]:
-    files: list[tuple[str, Path, bytes]] = []
-    for path in source_root.rglob("*"):
+def _stream_file_hash(path: Path) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    size = 0
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+            size += len(chunk)
+    return digest.hexdigest(), size
+
+
+def _source_files(source_root: Path) -> _SourceSnapshot:
+    files: list[_SourceFile] = []
+    aggregate = hashlib.sha256()
+    for path in sorted(source_root.rglob("*")):
         if not path.is_file():
             continue
         relative = path.relative_to(source_root).as_posix()
-        files.append((relative, path, path.read_bytes()))
-    return tuple(sorted(files, key=lambda item: item[0]))
+        before = path.stat()
+        aggregate.update(relative.encode("utf-8"))
+        aggregate.update(b"\0")
+        file_digest = hashlib.sha256()
+        size = 0
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                file_digest.update(chunk)
+                aggregate.update(chunk)
+                size += len(chunk)
+        aggregate.update(b"\0")
+        after = path.stat()
+        if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+            raise RuntimeError(f"source changed while scanning: {path}")
+        files.append(_SourceFile(relative, path, file_digest.hexdigest(), size, after.st_mtime_ns))
+    return _SourceSnapshot(tuple(files), aggregate.hexdigest())
 
 
-def _source_hash(files: tuple[tuple[str, Path, bytes], ...]) -> str:
-    digest = hashlib.sha256()
-    for relative, unused_path, file_bytes in files:
-        digest.update(relative.encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(file_bytes)
-        digest.update(b"\0")
-    return digest.hexdigest()
+def _source_hash(files: _SourceSnapshot) -> str:
+    return files.source_hash
 
 
 def _source_commit(source_root: Path) -> str | None:
@@ -262,30 +299,42 @@ def _source_commit(source_root: Path) -> str | None:
     if not head.startswith("ref: "):
         return head
     ref = head[5:].strip()
-    try:
-        return (git_dir / ref).read_text(encoding="utf-8").strip() or None
-    except OSError:
+    ref_dirs = [git_dir]
+    commondir_marker = git_dir / "commondir"
+    if commondir_marker.is_file():
         try:
-            packed = (git_dir / "packed-refs").read_text(encoding="utf-8")
+            common_dir = Path(commondir_marker.read_text(encoding="utf-8").strip())
         except OSError:
-            return None
-        for line in packed.splitlines():
-            if line and not line.startswith("#"):
-                commit, packed_ref = line.split(" ", 1)
-                if packed_ref == ref:
-                    return commit
+            common_dir = git_dir
+        if not common_dir.is_absolute():
+            common_dir = git_dir / common_dir
+        if common_dir != git_dir:
+            ref_dirs.append(common_dir)
+    for ref_dir in ref_dirs:
+        try:
+            return (ref_dir / ref).read_text(encoding="utf-8").strip() or None
+        except OSError:
+            try:
+                packed = (ref_dir / "packed-refs").read_text(encoding="utf-8")
+            except OSError:
+                continue
+            for line in packed.splitlines():
+                if line and not line.startswith("#") and not line.startswith("^"):
+                    parts = line.split(" ", 1)
+                    if len(parts) == 2 and parts[1] == ref:
+                        return parts[0]
     return None
 
 
-def _manifest(source_root: Path, spec: RuntimeSpec, source_hash: str, files: tuple[tuple[str, Path, bytes], ...]) -> dict[str, object]:
+def _manifest(source_root: Path, spec: RuntimeSpec, source_hash: str, files: _SourceSnapshot) -> dict[str, object]:
     return {
         "source_commit": _source_commit(source_root),
         "source_path": str(source_root.resolve()),
         "runtime": spec.runtime.value,
         "source_hash": source_hash,
         "files": {
-            relative: hashlib.sha256(file_bytes).hexdigest()
-            for relative, unused_path, file_bytes in files
+            file.relative: file.sha256
+            for file in files
         },
     }
 
@@ -305,8 +354,22 @@ def _collision(target: Path, detail: str) -> FileExistsError:
     return FileExistsError(f"cannot install skill at {target}: {detail}")
 
 
-def _copy_tree(source_root: Path, staging: Path) -> None:
+def _verify_snapshot_copy(source_root: Path, staging: Path, snapshot: _SourceSnapshot) -> None:
+    current = _source_files(source_root)
+    if current.source_hash != snapshot.source_hash or current.files != snapshot.files:
+        raise RuntimeError("source changed during copy")
+    for file in snapshot:
+        copied = staging / file.relative
+        if not copied.is_file():
+            raise RuntimeError(f"copied source diverged from manifest: {file.relative}")
+        copied_hash, copied_size = _stream_file_hash(copied)
+        if (copied_hash, copied_size) != (file.sha256, file.size):
+            raise RuntimeError(f"copied source diverged from manifest: {file.relative}")
+
+
+def _copy_tree(source_root: Path, staging: Path, snapshot: _SourceSnapshot) -> None:
     shutil.copytree(source_root, staging, symlinks=True, dirs_exist_ok=True)
+    _verify_snapshot_copy(source_root, staging, snapshot)
 
 
 def install_skill(
@@ -356,7 +419,7 @@ def install_skill(
     manifest = _manifest(source_root, spec, source_hash, files)
     staging = Path(tempfile.mkdtemp(prefix=f".{target.name}.", dir=str(target.parent)))
     try:
-        _copy_tree(source_root, staging)
+        _copy_tree(source_root, staging, files)
         manifest_path = staging / ".reflect-setup-source.json"
         temporary_manifest = staging / ".reflect-setup-source.json.tmp"
         temporary_manifest.write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n", encoding="utf-8")
