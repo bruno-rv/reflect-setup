@@ -1,17 +1,20 @@
 # clusters.yaml schema (this file is the doc + example; the real file is
-# clusters.yaml, gitignored, hand-authored/updated by each run -- no parser
-# needed, it's read by the LLM doing the run).
+# clusters.yaml, gitignored, hand-authored/updated by each run and validated by
+# the strict parser before verification or updates).
 #
 # Fields per entry:
 #   id           kebab-slug, stable across runs (never renamed once evidence
 #                references it)
 #   title        short human label
-#   status       new | fix-applied | monitor | wont-fix | resolved
+#   status       new | fix-applied | built-not-operating | monitor | wont-fix | resolved
 #                  - new: just clustered, no fix decided/applied yet
 #                  - fix-applied: a fix was applied -- NOT proof it operates.
 #                    Use this by default after "Applied <date>" work; only
 #                    move to resolved once a later run's digests show the
 #                    wired_check actually holds.
+#                  - built-not-operating: the fix exists, but invocation is
+#                    missing or the symptom recurred; move to resolved only
+#                    after all three checks pass in a later run.
 #                  - monitor: recurrence too low to act on, or already
 #                    covered and just being watched
 #                  - wont-fix: decided against, with rationale
@@ -25,6 +28,10 @@
 #   fix          one line: what was/would be changed. Empty string if none.
 #   wired_check  one line: how to verify the fix actually OPERATES in later
 #                digests (not just that it exists in the repo). Empty if n/a.
+#   artifact_ids stable runtime artifact IDs used to match typed coverage;
+#                required for fix-applied, built-not-operating, and resolved.
+#                Format: <runtime>:<global|project>:<root>/<relative path>.
+#                Migrate older unqualified IDs explicitly; they are not aliases.
 
 - id: recording-health-check-not-wired
   title: "Built health-check script never actually invoked by the watchdog"
@@ -36,6 +43,7 @@
   evidence: [agent-701a7b5f270123cad, 1838b72b]
   fix: "wired scripts/recording_health.py into the live_capture_gate.sh watchdog loop (stall check per cycle)"
   wired_check: "next window's digests show recording_health.py actually invoked/logged during a run, not just present in the repo"
+  artifact_ids: [claude:project:.claude/skills/recording-health/SKILL.md]
 
 - id: background-task-opacity
   title: "Long unattended runs give no progress signal, user asks 'is it stuck?'"
@@ -47,3 +55,4 @@
   evidence: [d13e3a2d, 0e7d8cea, 8f8d9dcb, 7412b54a]
   fix: "CLAUDE.md heartbeat rule (2026-04-22), extended to external CLI timeout+liveness and verbatim-in-subagent-prompts (2026-05-12)"
   wired_check: "next window's digests contain zero 'is it stuck'/'is the shell stuck' user messages and no background run silent for >10 min"
+  artifact_ids: [claude:global:.claude/CLAUDE.md]

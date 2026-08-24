@@ -1,0 +1,8 @@
+{"type":"user","timestamp":"2026-08-23T10:00:00Z","message":{"role":"user","content":"Correction: use canonical synthetic session A."}}
+{"type":"user","timestamp":"2026-08-23T10:01:00Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"synthetic-tool-a","is_error":true,"content":"Synthetic command failed in session A."}]}}
+{"type":"user","timestamp":"2026-08-23T10:02:00Z","message":{"role":"user","content":"[Request interrupted by synthetic fixture A]"}}
+{"type":"assistant","timestamp":"2026-08-23T10:03:00Z","message":{"role":"assistant","content":[{"type":"text","text":"Error: this assistant example is not a result."}]}}
+{"type":"user","timestamp":"2026-08-23T10:04:00Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"synthetic-tool-success-a","is_error":false,"content":"source_code = \"Error: example text only\""}]}}
+{"type":"user","timestamp":"2026-08-22T23:59:59Z","message":{"role":"user","content":"Immediately before the synthetic cutoff."}}
+{"type":"user","timestamp":"2026-08-23T00:00:00Z","message":{"role":"user","content":"Exactly at the synthetic cutoff."}}
+{synthetic malformed json line in an in-scope canonical fixture}

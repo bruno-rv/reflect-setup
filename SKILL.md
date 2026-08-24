@@ -1,48 +1,94 @@
 ---
 name: reflect-setup
-description: Diagnostic-only scan of .claude/projects/ session transcripts to find recurring friction and rank improvement candidates (skill / automation / fix / nothing) with cited evidence. Use when the user wants a periodic audit of their Claude Code setup based on how they actually work — a recurring friction and session-transcript scan, not a config-hygiene pass.
-argument-hint: [days-back] [project-filter]
-allowed-tools: Read, Grep, Glob, Bash, Task, Write, AskUserQuestion
+description: Diagnostic-only, dual-runtime scan of Claude Code or Codex session transcripts to find recurring friction and rank improvement candidates with cited evidence.
+metadata:
+  argument-hint: "[days-back] [project-filter]"
 ---
 
 # Reflect on Setup
 
-This is **diagnosis-only** through step 8 — never edit, delete, or "helpfully fix" anything until
-the optional Apply phase (opt-in only, never runs unasked). The only files written during
-diagnosis are `reflection-notes.md` and the local `clusters.yaml` ledger, plus throwaway scratch
-digests. If a fix seems obvious before Apply, propose it in the notes — do not apply it.
+`reflect-setup` is diagnosis-only through step 8. It never edits a project or
+dispatches a fixer unless the user explicitly approves an Apply preview in
+step 9. The same checkout supports Claude Code and Codex; the host workflow
+chooses the host task tool, while the Python core remains runtime-neutral.
 
 ## Quick start
 
-Run `/reflect-setup` (optionally `[days-back] [project-filter]`, default **last 30 days**, all
-projects). It scopes the window, inventories what already exists, digests + mines session
-transcripts, clusters findings, verifies fix-wiring, decides per cluster, and appends a dated
-section to `reflection-notes.md`. Full detail on every step: `REFERENCE.md`.
+Run `/reflect-setup` (optionally `[days-back] [project-filter]`, default **last
+30 days**, all projects). Choose the runtime explicitly when both session roots
+exist. The detailed operator contract is in `REFERENCE.md`.
 
 ## Workflow
 
-1. **Scope** — parse `$ARGUMENTS` for a day window (default 30) and project filter; state the
-   resolved scope. [Detail](REFERENCE.md#scope)
-2. **Inventory** — catalog existing skills, commands, subagents, hooks/permissions so nothing gets
-   re-proposed. [Detail](REFERENCE.md#inventory)
-3. **Digest** — run `scripts/digest.py` to pre-extract user text, errors, and interrupts from
-   session `.jsonl` files into a scratch dir. [Detail](REFERENCE.md#digest)
-4. **Mine** — dispatch one subagent per digest batch using `references/miner-prompt.md`.
-   [Detail](REFERENCE.md#mining)
-5. **Cluster** — merge miner outputs by underlying cause, with session list, counts, and dates.
-   [Detail](REFERENCE.md#clustering)
-6. **Fix-wiring verification** — check `clusters.yaml` entries with `status: fix-applied` for
-   proof the fix operates; flag **built-not-operating** if not. [Detail](REFERENCE.md#fix-wiring-verification)
-7. **Decide** — apply the recurrence/nature thresholds per cluster (new skill / automation / fix /
-   nothing). [Detail](REFERENCE.md#decision-thresholds)
-8. **Write notes** — append a dated, ranked section to `reflection-notes.md` plus a "Since last
-   run" summary. [Detail](REFERENCE.md#notes-format)
-9. **Apply (optional, opt-in)** — ask via `AskUserQuestion`; if yes, dispatch parallel fixers, each
-   required to return proof-of-fix. [Detail](REFERENCE.md#apply-phase)
+1. **Scope** — resolve `--runtime auto|claude|codex`, the UTC event-time window,
+   project filter, and subagent inclusion. [Detail](REFERENCE.md#scope)
+2. **Inventory** — record declared skills, commands, agents, hooks, and
+   configuration for the selected host; declaration is not operation.
+   [Detail](REFERENCE.md#inventory)
+   The host must separately collect typed `CoverageObservation` values for any
+   artifact whose eligibility, invocation, or prevention behavior it can prove;
+   the core never invents eligibility from inventory presence.
+3. **Digest** — run `scripts/reflect_setup.py` into a new
+   scratch directory. The manifest records every candidate source and fails
+   closed on malformed or unreadable input. [Detail](REFERENCE.md#digest)
+4. **Mine** — partition non-empty digest paths into disjoint batches and dispatch
+   one host miner per batch using `references/miner-prompt.md`. Miners return
+   JSON only; resume the run with `--miner-report` paths. [Detail](REFERENCE.md#miner-contract-and-batches)
+5. **Cluster** — validate every report against the manifest evidence index,
+   require exact batch coverage, and merge findings by cause while preserving
+   session, finding type, project, and evidence identity. A finding cannot cite
+   invented metadata or mix sessions. [Detail](REFERENCE.md#clustering-and-verification)
+6. **Verify wiring** — evaluate symptom, invocation, and independent behavioral
+   outcome checks for touched ledger entries. Missing evidence never resolves a
+   fix; recurrence produces `built-not-operating`. [Detail](REFERENCE.md#clustering-and-verification)
+7. **Rank** — calculate normalized trend metrics and the deterministic candidate
+   score, including recurrence, sessions, projects, days, confidence, impact,
+   regressions, and implementation cost. [Detail](REFERENCE.md#ranking)
+8. **Write report** — write the atomic `reflection-report.json`. The host then
+   appends its local notes and, when explicitly authorized, updates its ledger;
+   this Python core does not perform those host mutations. [Detail](REFERENCE.md#report-output)
+9. **Apply (optional, opt-in)** — the host asks for approval per selected
+   cluster, supplies an `ApplyRequest` and `WorkspaceState`, inspects bounded
+   previews, dispatches the host fixer, and supplies exact proof before any
+   ledger transition. [Detail](REFERENCE.md#apply)
+
+## CLI
+
+```bash
+PYTHONPATH=scripts python3 scripts/reflect_setup.py \
+  --runtime auto --since 30 --out .reflect-setup-run
+```
+
+Use `--miner-report PATH` once each host miner has returned its JSON report.
+Use `--include-subagents` only when sidechain material is intentionally in
+scope. `--ledger PATH` is required when the host wants Python to verify ledger
+entries; no implicit current-directory ledger is read. `--apply` requires one
+or more repeated `--approve-cluster ID` flags plus typed request/workspace
+inputs through `run_reflection()`; a bare CLI approval fails closed. The Python
+core never guesses or invokes a Claude/Codex task tool.
 
 ## Hard constraints
 
-- Diagnosis-only through step 8: no edits/fixes anywhere until Apply, and Apply never runs unasked.
-- Only writes `reflection-notes.md` and `clusters.yaml` (plus scratch digests) — nothing else.
-- Default window is **30 days**; an explicit window in `$ARGUMENTS` overrides it, but the ledger's
-  last-run date still drives the "Since last run" comparison in step 8.
+- Runtime selection is explicit when auto-detection is ambiguous.
+- Event timestamps, not filesystem mtimes, determine scope.
+- A partial manifest or incomplete batch cannot be reported as complete.
+- Operating ledger `artifact_ids` use runtime/root-namespaced inventory IDs;
+  legacy unqualified IDs are not aliases.
+- Python writes only the local manifest, scratch digests, and report. The host
+  owns notes/ledger updates; Apply is never implicit.
+- No privacy, redaction, or retention behavior is added by this skill.
+
+## Host dispatch concepts
+
+- **Claude Code:** use the active Claude host's configured task/subagent
+  delegation to launch one bounded miner per digest batch. Collect each JSON
+  report, resume the Python run, then obtain consent before constructing one
+  request/workspace pair per approved cluster. Dispatch fixers through that
+  same host mechanism and return command output plus exact `:: PASS` records.
+- **Codex:** use the active Codex host's configured worker/subagent delegation
+  for the same one-batch/one-report flow. After consent, construct the typed
+  request/workspace inputs, inspect Python previews, execute the approved fix
+  through the active Codex workflow, and return a validated `FixProof`.
+
+Neither flow assumes a particular task-tool name. The host owns execution;
+Python validates manifests, reports, previews, and proofs.

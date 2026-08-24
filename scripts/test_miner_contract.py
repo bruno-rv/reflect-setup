@@ -1,0 +1,497 @@
+"""Runnable checks for the structured miner report contract."""
+import json
+from datetime import datetime, timezone
+
+from miner_contract import (
+    EvidenceRef,
+    Finding,
+    FindingType,
+    MinerReport,
+    ReportValidationError,
+    merge_reports,
+    parse_report,
+)
+from test_support import make_batch, make_manifest, make_report
+
+
+def manifest_and_batch():
+    manifest = make_manifest(
+        run_id="run-1",
+        files=("project__session-a--abc.md",),
+        lines=(("project__session-a--abc.md", 4, "2026-08-23T10:00:00Z", "user"),),
+        project="project-a",
+    )
+    batch = make_batch("batch-1", ("project__session-a--abc.md",))
+    return manifest, batch
+
+
+def valid_payload(**overrides):
+    payload = {
+        "schema_version": 1,
+        "runtime": "claude",
+        "run_id": "run-1",
+        "batch_id": "batch-1",
+        "digest_paths": ["project__session-a--abc.md"],
+        "findings": [
+            {
+                "cluster_key": "repeated-shell-retry",
+                "finding_type": "failure",
+                "session_id": "session-a",
+                "paraphrase": "A command needed repeated retries.",
+                "occurrence_count": 1,
+                "confidence": 0.9,
+                "evidence": [
+                    {
+                        "digest_path": "project__session-a--abc.md",
+                        "project": "project-a",
+                        "source_line": 4,
+                        "timestamp": "2026-08-23T10:00:00Z",
+                        "kind": "failure",
+                    }
+                ],
+            }
+        ],
+        "themes": ["repeated command retries"],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_valid_report_preserves_typed_evidence():
+    manifest, batch = manifest_and_batch()
+    raw = json.dumps(valid_payload())
+    report = parse_report(raw, manifest, batch)
+    assert report.findings[0].evidence[0].source_line == 4
+    assert report.findings[0].confidence == 0.9
+
+
+def test_report_accepts_documented_evidence_occurrence_count():
+    manifest, batch = manifest_and_batch()
+    payload = valid_payload()
+    payload["findings"][0]["occurrence_count"] = 3
+    payload["findings"][0]["evidence"][0]["occurrence_count"] = 3
+    report = parse_report(json.dumps(payload), manifest, batch)
+    assert report.findings[0].evidence[0].occurrence_count == 3
+
+
+def test_report_accepts_strict_rfc3339_z_and_numeric_offset():
+    manifest, batch = manifest_and_batch()
+    for timestamp, expected in (
+        ("2026-08-23T10:00:00Z", datetime(2026, 8, 23, 10, tzinfo=timezone.utc)),
+        ("2026-08-23T12:00:00+02:00", datetime(2026, 8, 23, 10, tzinfo=timezone.utc)),
+    ):
+        payload = valid_payload()
+        payload["findings"][0]["evidence"][0]["timestamp"] = timestamp
+        report = parse_report(json.dumps(payload), manifest, batch)
+        assert report.findings[0].evidence[0].timestamp == expected
+
+
+def test_report_rejects_evidence_for_nonexistent_source_line():
+    manifest, batch = manifest_and_batch()
+    payload = valid_payload()
+    payload["findings"][0]["evidence"][0]["source_line"] = 999
+    try:
+        parse_report(json.dumps(payload), manifest, batch)
+    except ReportValidationError as exc:
+        assert "line" in str(exc) or "index" in str(exc)
+    else:
+        raise AssertionError("evidence must cite a retained source line")
+
+
+def test_report_rejects_evidence_with_wrong_index_timestamp():
+    manifest, batch = manifest_and_batch()
+    payload = valid_payload()
+    payload["findings"][0]["evidence"][0]["timestamp"] = "2026-08-23T11:00:00Z"
+    try:
+        parse_report(json.dumps(payload), manifest, batch)
+    except ReportValidationError as exc:
+        assert "timestamp" in str(exc) or "index" in str(exc)
+    else:
+        raise AssertionError("evidence timestamp must match the retained signal")
+
+
+def test_report_rejects_finding_session_not_backed_by_evidence():
+    manifest, batch = manifest_and_batch()
+    payload = valid_payload()
+    payload["findings"][0]["session_id"] = "invented-session"
+    try:
+        parse_report(json.dumps(payload), manifest, batch)
+    except ReportValidationError as exc:
+        assert "session" in str(exc)
+    else:
+        raise AssertionError("finding session must match cited digest metadata")
+
+
+def test_report_rejects_kind_not_supported_by_indexed_error_signal():
+    manifest = make_manifest(
+        run_id="run-1",
+        files=("error.md",),
+        lines=(("error.md", 1, "2026-08-23T10:00:00Z", "error"),),
+        project="project-a",
+    )
+    batch = make_batch("batch-1", ("error.md",))
+    payload = valid_payload()
+    payload["digest_paths"] = ["error.md"]
+    payload["findings"][0]["finding_type"] = "correction"
+    payload["findings"][0]["evidence"][0].update(
+        {
+            "digest_path": "error.md",
+            "project": "project-a",
+            "source_line": 1,
+            "kind": "correction",
+        }
+    )
+    try:
+        parse_report(json.dumps(payload), manifest, batch)
+    except ReportValidationError as exc:
+        assert "kind" in str(exc)
+    else:
+        raise AssertionError("indexed signal kind must constrain miner evidence")
+
+
+def test_report_rejects_mixed_sessions_under_one_finding():
+    manifest = make_manifest(
+        run_id="run-1",
+        files=("a.md", "b.md"),
+        projects=(("a.md", "project-a"), ("b.md", "project-b")),
+        sessions=(("a.md", "session-a"), ("b.md", "session-b")),
+    )
+    batch = make_batch("batch-1", ("a.md", "b.md"))
+    payload = valid_payload()
+    payload["digest_paths"] = ["a.md", "b.md"]
+    finding = payload["findings"][0]
+    finding["evidence"] = [
+        {
+            "digest_path": "a.md",
+            "project": "project-a",
+            "source_line": 1,
+            "timestamp": "2026-08-23T10:00:00Z",
+            "kind": "failure",
+        },
+        {
+            "digest_path": "b.md",
+            "project": "project-b",
+            "source_line": 1,
+            "timestamp": "2026-08-23T10:00:00Z",
+            "kind": "failure",
+        },
+    ]
+    finding["occurrence_count"] = 2
+    try:
+        parse_report(json.dumps(payload), manifest, batch)
+    except ReportValidationError as exc:
+        assert "session" in str(exc)
+    else:
+        raise AssertionError("a finding cannot cite mixed sessions")
+
+
+def test_report_rejects_rfc3339_near_misses():
+    manifest, batch = manifest_and_batch()
+    for timestamp in (
+        "2026-08-23 10:00:00Z",
+        "2026-08-23T10:00Z",
+        "2026-08-23T10:00:00",
+    ):
+        payload = valid_payload()
+        payload["findings"][0]["evidence"][0]["timestamp"] = timestamp
+        try:
+            parse_report(json.dumps(payload), manifest, batch)
+        except ReportValidationError:
+            pass
+        else:
+            raise AssertionError(f"timestamp near-miss must fail: {timestamp}")
+
+
+def test_report_rejects_evidence_from_another_batch():
+    manifest, batch = manifest_and_batch()
+    payload = valid_payload()
+    payload["findings"][0]["evidence"][0]["digest_path"] = "not-in-batch.md"
+    try:
+        parse_report(json.dumps(payload), manifest, batch)
+    except ReportValidationError as exc:
+        assert "batch" in str(exc)
+    else:
+        raise AssertionError("cross-batch evidence must be rejected")
+
+
+def test_report_rejects_evidence_with_wrong_project_identity():
+    manifest, batch = manifest_and_batch()
+    payload = valid_payload()
+    payload["findings"][0]["evidence"][0]["project"] = "another-project"
+    try:
+        parse_report(json.dumps(payload), manifest, batch)
+    except ReportValidationError as exc:
+        assert "project" in str(exc)
+    else:
+        raise AssertionError("evidence project must match manifest metadata")
+
+
+def test_report_rejects_prose_and_out_of_range_confidence():
+    manifest, batch = manifest_and_batch()
+    for raw in ("Here is the report: {}", json.dumps(valid_payload(confidence=1.1))):
+        try:
+            parse_report(raw, manifest, batch)
+        except ReportValidationError:
+            pass
+        else:
+            raise AssertionError("invalid report must fail")
+
+
+def test_report_rejects_missing_or_extra_fields():
+    manifest, batch = manifest_and_batch()
+    payload = valid_payload()
+    payload.pop("themes")
+    try:
+        parse_report(json.dumps(payload), manifest, batch)
+    except ReportValidationError:
+        pass
+    else:
+        raise AssertionError("missing field must fail")
+
+    payload = valid_payload()
+    payload["unexpected"] = True
+    try:
+        parse_report(json.dumps(payload), manifest, batch)
+    except ReportValidationError:
+        pass
+    else:
+        raise AssertionError("extra field must fail")
+
+
+def test_report_rejects_batch_path_mismatch():
+    manifest, batch = manifest_and_batch()
+    payload = valid_payload(digest_paths=[])
+    try:
+        parse_report(json.dumps(payload), manifest, batch)
+    except ReportValidationError as exc:
+        assert "digest_paths" in str(exc)
+    else:
+        raise AssertionError("assigned batch paths must be declared exactly")
+
+
+def test_report_deduplicates_evidence_references():
+    manifest, batch = manifest_and_batch()
+    payload = valid_payload()
+    evidence = payload["findings"][0]["evidence"][0]
+    payload["findings"][0]["evidence"].append(dict(evidence))
+    report = parse_report(json.dumps(payload), manifest, batch)
+    assert len(report.findings[0].evidence) == 1
+
+
+def test_merge_rejects_missing_batch_coverage():
+    reports = [make_report("batch-1", "a.md"), make_report("batch-2", "b.md")]
+    manifest = make_manifest(run_id="run-1", files=("a.md", "b.md", "c.md"))
+    try:
+        merge_reports(reports, manifest)
+    except ReportValidationError as exc:
+        assert "c.md" in str(exc)
+    else:
+        raise AssertionError("uncovered digest must fail closed")
+
+
+def test_merge_rejects_overlapping_batch_coverage():
+    manifest = make_manifest(run_id="run-1", files=("a.md",))
+    reports = [make_report("batch-1", "a.md"), make_report("batch-2", "a.md")]
+    try:
+        merge_reports(reports, manifest)
+    except ReportValidationError as exc:
+        assert "overlap" in str(exc)
+    else:
+        raise AssertionError("overlapping batches must fail closed")
+
+
+def test_merge_rejects_duplicate_batch_ids():
+    manifest = make_manifest(run_id="run-1", files=("a.md",))
+    reports = [make_report("batch-1", "a.md"), make_report("batch-1", "a.md")]
+    try:
+        merge_reports(reports, manifest)
+    except ReportValidationError as exc:
+        assert "duplicate" in str(exc)
+    else:
+        raise AssertionError("duplicate batch IDs must fail closed")
+
+
+def test_merge_rejects_typed_finding_without_evidence():
+    manifest = make_manifest(run_id="run-1", files=("a.md",))
+    finding = Finding(
+        cluster_key="fixture",
+        finding_type=FindingType.FAILURE,
+        session_id="session-a",
+        paraphrase="fixture failure",
+        occurrence_count=1,
+        confidence=0.5,
+        evidence=(),
+    )
+    report = MinerReport(1, "claude", "run-1", "batch-1", ("a.md",), (finding,), ())
+    try:
+        merge_reports((report,), manifest)
+    except ReportValidationError as exc:
+        assert "evidence" in str(exc)
+    else:
+        raise AssertionError("typed findings without evidence must fail closed")
+
+
+def test_merge_rejects_typed_finding_with_invented_session_id():
+    manifest = make_manifest(run_id="run-1", files=("a.md",))
+    report = make_report("batch-1", "a.md")
+    finding = report.findings[0]
+    invented = Finding(
+        finding.cluster_key,
+        finding.finding_type,
+        "invented-session",
+        finding.paraphrase,
+        finding.occurrence_count,
+        finding.confidence,
+        finding.evidence,
+    )
+    report = MinerReport(
+        report.schema_version,
+        report.runtime,
+        report.run_id,
+        report.batch_id,
+        report.digest_paths,
+        (invented,),
+        report.themes,
+    )
+    try:
+        merge_reports((report,), manifest)
+    except ReportValidationError as exc:
+        assert "session" in str(exc)
+    else:
+        raise AssertionError("typed findings must bind session IDs to evidence")
+
+
+def test_merge_sums_distinct_evidence_and_sorts_clusters():
+    manifest = make_manifest(run_id="run-1", files=("a.md", "b.md"))
+    first = make_report("batch-1", "a.md")
+    second = make_report("batch-2", "b.md")
+    merged = merge_reports((first, second), manifest)
+    assert len(merged) == 1
+    assert merged[0].cluster_key == "fixture"
+    assert merged[0].occurrence_count == 2
+    assert len(merged[0].evidence) == 2
+    assert merged[0].confidence == 0.5
+
+
+def test_merge_rejects_aggregate_count_not_matching_explicit_evidence_counts():
+    manifest = make_manifest(
+        run_id="run-1",
+        files=("a.md", "b.md"),
+        projects=(("a.md", "project-a"), ("b.md", "project-a")),
+    )
+    timestamp = datetime(2026, 8, 23, 10, tzinfo=timezone.utc)
+    finding = Finding(
+        "fixture", FindingType.FAILURE, "session-a", "first", 4, 0.8,
+        (
+            EvidenceRef("a.md", 1, timestamp, FindingType.FAILURE, "project-a", 2),
+            EvidenceRef("b.md", 1, timestamp, FindingType.FAILURE, "project-a", 1),
+        ),
+    )
+    report = MinerReport(1, "claude", "run-1", "batch-1", ("a.md", "b.md"), (finding,), ())
+    try:
+        merge_reports((report,), manifest)
+    except ReportValidationError as exc:
+        assert "occurrence" in str(exc)
+    else:
+        raise AssertionError("aggregate count must match explicit evidence counts")
+
+
+def test_merge_counts_only_distinct_evidence_when_findings_partially_overlap():
+    manifest = make_manifest(
+        run_id="run-1",
+        files=("a.md", "b.md"),
+        projects=(("a.md", "project-a"), ("b.md", "project-a")),
+    )
+    timestamp = datetime(2026, 8, 23, 10, tzinfo=timezone.utc)
+    first = Finding(
+        "fixture", FindingType.FAILURE, "session-a", "first", 3, 0.8,
+        (
+            EvidenceRef("a.md", 1, timestamp, FindingType.FAILURE, "project-a", 2),
+            EvidenceRef("b.md", 1, timestamp, FindingType.FAILURE, "project-a", 1),
+        ),
+    )
+    second = Finding(
+        "fixture", FindingType.FAILURE, "session-a", "second", 2, 0.7,
+        (EvidenceRef("a.md", 1, timestamp, FindingType.FAILURE, "project-a", 2),),
+    )
+    report = MinerReport(1, "claude", "run-1", "batch-a", ("a.md", "b.md"), (first, second), ())
+    merged = merge_reports((report,), manifest)
+    assert merged[0].occurrence_count == 3
+    assert sum(ref.occurrence_count for ref in merged[0].evidence) == 3
+
+
+def test_merge_preserves_distinct_sessions_and_finding_types():
+    manifest = make_manifest(
+        run_id="run-1",
+        files=("a.md", "b.md", "c.md"),
+        projects=(("a.md", "project-a"), ("b.md", "project-b"), ("c.md", "project-c")),
+        sessions=(("a.md", "session-a"), ("b.md", "session-b"), ("c.md", "session-c")),
+        lines=(
+            ("a.md", 1, "2026-08-23T10:00:00Z", "failure"),
+            ("b.md", 1, "2026-08-23T10:00:00Z", "failure"),
+            ("c.md", 1, "2026-08-23T10:00:00Z", "complaint"),
+        ),
+    )
+    reports = []
+    for batch_id, path, session_id, finding_type, project in (
+        ("batch-1", "a.md", "session-a", FindingType.FAILURE, "project-a"),
+        ("batch-2", "b.md", "session-b", FindingType.FAILURE, "project-b"),
+        ("batch-3", "c.md", "session-c", FindingType.COMPLAINT, "project-c"),
+    ):
+        evidence = EvidenceRef(
+            path,
+            1,
+            datetime(2026, 8, 23, 10, tzinfo=timezone.utc),
+            finding_type,
+            project,
+        )
+        finding = Finding("same-cluster", finding_type, session_id, "fixture", 1, 0.8, (evidence,))
+        reports.append(MinerReport(1, "claude", "run-1", batch_id, (path,), (finding,), ()))
+
+    merged = merge_reports(tuple(reports), manifest)
+    assert [(item.session_id, item.finding_type) for item in merged] == [
+        ("session-a", FindingType.FAILURE),
+        ("session-b", FindingType.FAILURE),
+        ("session-c", FindingType.COMPLAINT),
+    ]
+    assert sum(item.occurrence_count for item in merged) == 3
+    assert [len(item.evidence) for item in merged] == [1, 1, 1]
+
+
+def test_merge_accounts_for_manifest_files_without_digest_paths():
+    manifest = make_manifest(run_id="run-1", files=("a.md", "empty.md"))
+    manifest = manifest.__class__(
+        schema_version=manifest.schema_version,
+        run_id=manifest.run_id,
+        runtime=manifest.runtime,
+        scope=manifest.scope,
+        source_files=(manifest.source_files[0], manifest.source_files[1].__class__(
+            source_path="empty.md",
+            sha256=manifest.source_files[1].sha256,
+            scanned=True,
+            readable=True,
+            json_lines=0,
+            malformed_lines=0,
+            untimestamped_lines=0,
+            in_scope_events=0,
+            project="fixture-project",
+            digest_path=None,
+        )),
+        sessions_scanned=manifest.sessions_scanned,
+        sessions_with_signals=1,
+        signal_counts=manifest.signal_counts,
+        complete=True,
+    )
+    merged = merge_reports((make_report("batch-1", "a.md"),), manifest)
+    assert merged[0].cluster_key == "fixture"
+
+
+def run_all():
+    tests = [value for name, value in globals().items() if name.startswith("test_")]
+    for test in tests:
+        test()
+    print(f"{len(tests)} tests passed")
+
+
+if __name__ == "__main__":
+    run_all()

@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "window_since": "2026-08-23T00:00:00Z",
+  "retained_signals": {
+    "claude": [
+      {"session_id": "canonical-a", "source_line": 1, "kind": "user"},
+      {"session_id": "canonical-a", "source_line": 2, "kind": "error"},
+      {"session_id": "canonical-a", "source_line": 3, "kind": "interrupt"},
+      {"session_id": "canonical-a", "source_line": 7, "kind": "user"},
+      {"session_id": "canonical-b", "source_line": 1, "kind": "user"},
+      {"session_id": "canonical-b", "source_line": 5, "kind": "interrupt"},
+      {"session_id": "canonical-b", "source_line": 6, "kind": "user"},
+      {"session_id": "canonical-b", "source_line": 7, "kind": "error"}
+    ],
+    "codex": [
+      {"session_id": "codex-a", "source_line": 2, "kind": "user"},
+      {"session_id": "codex-a", "source_line": 3, "kind": "error"},
+      {"session_id": "codex-a", "source_line": 4, "kind": "interrupt"},
+      {"session_id": "codex-a", "source_line": 8, "kind": "user"},
+      {"session_id": "codex-b", "source_line": 2, "kind": "user"},
+      {"session_id": "codex-b", "source_line": 6, "kind": "interrupt"},
+      {"session_id": "codex-b", "source_line": 7, "kind": "user"},
+      {"session_id": "codex-b", "source_line": 8, "kind": "error"}
+    ]
+  },
+  "excluded_records": {
+    "claude": [
+      {"session_id": "canonical-a", "source_line": 4, "reason": "assistant text"},
+      {"session_id": "canonical-a", "source_line": 5, "reason": "successful tool output"},
+      {"session_id": "canonical-a", "source_line": 6, "reason": "immediately before cutoff"},
+      {"session_id": "canonical-b", "source_line": 2, "reason": "assistant text"},
+      {"session_id": "canonical-b", "source_line": 3, "reason": "immediately before cutoff"},
+      {"session_id": "canonical-b", "source_line": 4, "reason": "successful tool output"}
+    ],
+    "codex": [
+      {"session_id": "codex-a", "source_line": 5, "reason": "assistant text"},
+      {"session_id": "codex-a", "source_line": 6, "reason": "successful tool output"},
+      {"session_id": "codex-a", "source_line": 7, "reason": "immediately before cutoff"},
+      {"session_id": "codex-b", "source_line": 3, "reason": "assistant text"},
+      {"session_id": "codex-b", "source_line": 4, "reason": "immediately before cutoff"},
+      {"session_id": "codex-b", "source_line": 5, "reason": "successful tool output"}
+    ]
+  },
+  "manifests_complete": {"claude": false, "codex": false},
+  "malformed_lines": {"claude": 2, "codex": 2},
+  "batch_report_counts": {"claude": 2, "codex": 2},
+  "report_validation_failures": 0,
+  "batch_coverage_complete": true,
+  "score_is_deterministic": true,
+  "expected_ranking": [
+    "claude-canonical-a-2-error",
+    "claude-canonical-b-7-error",
+    "codex-codex-a-3-error",
+    "codex-codex-b-8-error",
+    "claude-canonical-a-7-user",
+    "claude-canonical-b-1-user",
+    "codex-codex-a-8-user",
+    "codex-codex-b-2-user",
+    "claude-canonical-a-1-user",
+    "claude-canonical-b-6-user",
+    "codex-codex-a-2-user",
+    "codex-codex-b-7-user",
+    "claude-canonical-a-3-interrupt",
+    "claude-canonical-b-5-interrupt",
+    "codex-codex-a-4-interrupt",
+    "codex-codex-b-6-interrupt"
+  ]
+}

@@ -7,8 +7,19 @@ import json
 import os
 import shutil
 import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import digest
+from digest import (
+    IncompleteDigestError,
+    LegacyDigestWorkflowError,
+    SignalKind,
+    run_digest,
+    signals_from_event,
+)
+from runtime import Scope, resolve_runtime
 
 
 def make_line(entry):
@@ -121,6 +132,614 @@ def test_malformed_json_line_skipped():
     assert signals == []
 
 
+def test_event_timestamp_controls_scope_even_when_mtime_is_stale():
+    with TemporaryDirectory() as raw:
+        root = Path(raw)
+        source_root = root / "projects" / "project-a"
+        source_root.mkdir(parents=True)
+        source = source_root / "session.jsonl"
+        source.write_text(
+            '{"type":"user","timestamp":"2026-08-23T10:00:00Z",'
+            '"message":{"role":"user","content":"recent event"}}\n'
+        )
+        os.utime(source, (1, 1))
+        spec = resolve_runtime("claude", home=root, env={}, source_root=source_root.parent)
+        scope = Scope(datetime(2026, 8, 23, 0, 0, tzinfo=timezone.utc), None, False)
+        manifest = run_digest(spec, scope, root / "out")
+        assert manifest.sessions_with_signals == 1
+        assert manifest.signal_counts["user"] == 1
+
+
+def test_manifest_indexes_each_retained_signal_with_source_truth():
+    with TemporaryDirectory() as raw:
+        root = Path(raw)
+        source_root = root / "projects" / "project-a"
+        source_root.mkdir(parents=True)
+        (source_root / "session.jsonl").write_text(
+            '{"type":"user","timestamp":"2026-08-23T10:00:00Z",'
+            '"message":{"role":"user","content":"recent event"}}\n'
+        )
+        spec = resolve_runtime("claude", home=root, env={}, source_root=source_root.parent)
+        scope = Scope(datetime(2026, 8, 23, 0, 0, tzinfo=timezone.utc), None, False)
+        manifest = run_digest(spec, scope, root / "out")
+        source = manifest.source_files[0]
+        assert len(source.evidence_index) == 1
+        entry = source.evidence_index[0]
+        assert entry.source_line == 1
+        assert entry.timestamp == datetime(2026, 8, 23, 10, tzinfo=timezone.utc)
+        assert entry.kind.value == "user"
+        assert entry.project == "project-a"
+        assert entry.session_id == "session"
+        persisted = json.loads((root / "out" / "manifest.json").read_text())
+        assert persisted["source_files"][0]["evidence_index"] == [
+            {
+                "source_line": 1,
+                "timestamp": "2026-08-23T10:00:00Z",
+                "kind": "user",
+                "project": "project-a",
+                "session_id": "session",
+            }
+        ]
+
+
+def test_typed_digest_json_record_round_trips_source_identity_and_text():
+    with TemporaryDirectory() as raw:
+        root = Path(raw)
+        project = 'project with "quotes" \\ backslashes'
+        session = 'session with "quotes" \\ backslashes'
+        source_root = root / "projects" / project
+        source_root.mkdir(parents=True)
+        lines = [
+            make_line(
+                {
+                    "type": "assistant",
+                    "timestamp": f"2026-08-23T10:0{index}:00Z",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "context"}],
+                    },
+                }
+            )
+            for index in range(6)
+        ]
+        lines.append(
+            make_line(
+                {
+                    "type": "user",
+                    "timestamp": "2026-08-23T10:06:00Z",
+                    "message": {
+                        "role": "user",
+                        "content": 'line one\nline "two" \\ backslash',
+                    },
+                }
+            )
+        )
+        (source_root / f"{session}.jsonl").write_text("".join(lines))
+        spec = resolve_runtime("claude", home=root, env={}, source_root=source_root.parent)
+        manifest = run_digest(
+            spec,
+            Scope(datetime(2026, 8, 23, tzinfo=timezone.utc), None, False),
+            root / "out",
+        )
+        digest_path = Path(manifest.source_files[0].digest_path)
+        signal_lines = [
+            (index, line)
+            for index, line in enumerate(digest_path.read_text().splitlines(), 1)
+            if line.startswith("{")
+        ]
+        assert len(signal_lines) == 1
+        local_line, signal_line = signal_lines[0]
+        record = json.loads(signal_line)
+        assert record == {
+            "source_line": 7,
+            "timestamp": "2026-08-23T10:06:00Z",
+            "source_kind": "user",
+            "project": project,
+            "session_id": session,
+            "text": 'line one\nline "two" \\ backslash',
+        }
+        assert local_line != record["source_line"]
+        assert "\n" not in signal_line
+        assert "\\n" in signal_line
+
+
+def test_miner_contract_maps_source_kind_to_classified_evidence_kind():
+    from miner_contract import parse_report
+    from test_support import make_batch, make_manifest
+
+    manifest = make_manifest(
+        run_id="run-1",
+        files=("project__session-a--abc.md",),
+        lines=(("project__session-a--abc.md", 4, "2026-08-23T10:00:00Z", "user"),),
+        project="project-a",
+    )
+    batch = make_batch("batch-1", ("project__session-a--abc.md",))
+    report = parse_report(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "runtime": "claude",
+                "run_id": "run-1",
+                "batch_id": "batch-1",
+                "digest_paths": ["project__session-a--abc.md"],
+                "findings": [
+                    {
+                        "cluster_key": "classified-user-correction",
+                        "finding_type": "failure",
+                        "session_id": "session-a",
+                        "paraphrase": "A user signal was classified as a failure.",
+                        "occurrence_count": 1,
+                        "confidence": 0.9,
+                        "evidence": [
+                            {
+                                "digest_path": "project__session-a--abc.md",
+                                "project": "project-a",
+                                "source_line": 4,
+                                "timestamp": "2026-08-23T10:00:00Z",
+                                "kind": "failure",
+                            }
+                        ],
+                    }
+                ],
+                "themes": [],
+            }
+        ),
+        manifest,
+        batch,
+    )
+    assert manifest.source_files[0].evidence_index[0].kind.value == "user"
+    assert report.findings[0].evidence[0].kind.value == "failure"
+
+
+def test_old_event_is_excluded_from_recent_file_and_output_is_collision_free():
+    with TemporaryDirectory() as raw:
+        root = Path(raw)
+        source_root = root / "projects" / "project-a" / "nested"
+        source_root.mkdir(parents=True)
+        first = source_root / "same.jsonl"
+        second = root / "projects" / "project-a" / "same.jsonl"
+        second.parent.mkdir(parents=True, exist_ok=True)
+        line = '{"type":"user","timestamp":"2026-08-01T10:00:00Z",' \
+               '"message":{"role":"user","content":"old"}}\n'
+        first.write_text(line)
+        second.write_text(line)
+        spec = resolve_runtime("claude", home=root, env={}, source_root=root / "projects")
+        scope = Scope(datetime(2026, 8, 23, 0, 0, tzinfo=timezone.utc), None, False)
+        manifest = run_digest(spec, scope, root / "out")
+        assert manifest.sessions_with_signals == 0
+        assert len(list((root / "out").glob("*.md"))) == 0
+        assert len(manifest.source_files) == 2
+
+
+def test_codex_extracts_canonical_user_and_true_tool_error_only():
+    scope = Scope(datetime(2026, 8, 23, tzinfo=timezone.utc), None, False)
+    user = make_line(
+        {
+            "type": "response_item",
+            "timestamp": "2026-08-23T10:00:00Z",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "please correct this"}],
+            },
+        }
+    )
+    tool_error = make_line(
+        {
+            "type": "response_item",
+            "timestamp": "2026-08-23T10:01:00Z",
+            "payload": {
+                "type": "function_call_output",
+                "is_error": True,
+                "output": "Error: command failed",
+            },
+        }
+    )
+    assistant = make_line(
+        {
+            "type": "response_item",
+            "timestamp": "2026-08-23T10:02:00Z",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Error: not a user signal"}],
+            },
+        }
+    )
+    successful_tool = make_line(
+        {
+            "type": "response_item",
+            "timestamp": "2026-08-23T10:03:00Z",
+            "payload": {
+                "type": "function_call_output",
+                "is_error": False,
+                "output": "Error: source text only",
+            },
+        }
+    )
+    assert signals_from_event(
+        user,
+        runtime="codex",
+        session_id="session-1",
+        source_line=1,
+        scope=scope,
+    )[0].kind is SignalKind.USER
+    assert signals_from_event(
+        tool_error,
+        runtime="codex",
+        session_id="session-1",
+        source_line=2,
+        scope=scope,
+    )[0].kind is SignalKind.ERROR
+    assert signals_from_event(
+        assistant,
+        runtime="codex",
+        session_id="session-1",
+        source_line=3,
+        scope=scope,
+    ) == ()
+    assert signals_from_event(
+        successful_tool,
+        runtime="codex",
+        session_id="session-1",
+        source_line=4,
+        scope=scope,
+    ) == ()
+
+
+def test_codex_custom_tool_output_with_explicit_failure_status_is_error():
+    scope = Scope(datetime(2026, 8, 23, tzinfo=timezone.utc), None, False)
+    line = make_line(
+        {
+            "type": "response_item",
+            "timestamp": "2026-08-23T10:01:00Z",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "output": [
+                    {"type": "input_text", "text": "Process exited with code 1"},
+                    {"type": "input_text", "text": "details"},
+                ],
+            },
+        }
+    )
+    signals = signals_from_event(
+        line,
+        runtime="codex",
+        session_id="session-1",
+        source_line=1,
+        scope=scope,
+    )
+    assert len(signals) == 1 and signals[0].kind is SignalKind.ERROR, signals
+    assert signals[0].text == "Process exited with code 1\ndetails", signals[0].text
+
+
+def test_codex_function_output_with_explicit_failure_status_is_error():
+    scope = Scope(datetime(2026, 8, 23, tzinfo=timezone.utc), None, False)
+    line = make_line(
+        {
+            "type": "response_item",
+            "timestamp": "2026-08-23T10:01:00Z",
+            "payload": {
+                "type": "function_call_output",
+                "output": "Command failed\nexit code: 1\ndetails",
+            },
+        }
+    )
+    signals = signals_from_event(
+        line,
+        runtime="codex",
+        session_id="session-1",
+        source_line=1,
+        scope=scope,
+    )
+    assert len(signals) == 1 and signals[0].kind is SignalKind.ERROR, signals
+    assert signals[0].text == "Command failed\nexit code: 1\ndetails", signals[0].text
+
+
+def test_codex_successful_tool_output_with_error_looking_detail_is_ignored():
+    scope = Scope(datetime(2026, 8, 23, tzinfo=timezone.utc), None, False)
+    line = make_line(
+        {
+            "type": "response_item",
+            "timestamp": "2026-08-23T10:01:00Z",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "output": [
+                    {"type": "input_text", "text": "Script completed"},
+                    {"type": "input_text", "text": "Error: source text only"},
+                ],
+            },
+        }
+    )
+    assert signals_from_event(
+        line,
+        runtime="codex",
+        session_id="session-1",
+        source_line=1,
+        scope=scope,
+    ) == ()
+
+
+def test_codex_error_looking_first_status_line_is_not_failure_metadata():
+    scope = Scope(datetime(2026, 8, 23, tzinfo=timezone.utc), None, False)
+    line = make_line(
+        {
+            "type": "response_item",
+            "timestamp": "2026-08-23T10:01:00Z",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "output": [
+                    {"type": "input_text", "text": "Error: source text only"},
+                    {"type": "input_text", "text": "successful tool details"},
+                ],
+            },
+        }
+    )
+    assert signals_from_event(
+        line,
+        runtime="codex",
+        session_id="session-1",
+        source_line=1,
+        scope=scope,
+    ) == ()
+
+
+def test_codex_successful_output_takes_precedence_over_error_looking_content():
+    scope = Scope(datetime(2026, 8, 23, tzinfo=timezone.utc), None, False)
+    line = make_line(
+        {
+            "type": "response_item",
+            "timestamp": "2026-08-23T10:01:00Z",
+            "payload": {
+                "type": "function_call_output",
+                "output": "Script completed",
+                "content": "Error: source text only",
+            },
+        }
+    )
+    assert signals_from_event(
+        line,
+        runtime="codex",
+        session_id="session-1",
+        source_line=1,
+        scope=scope,
+    ) == ()
+
+
+def test_numeric_timestamp_is_parsed_as_utc_and_old_events_are_excluded():
+    scope = Scope(datetime(2026, 8, 23, tzinfo=timezone.utc), None, False)
+    recent = make_line(
+        {
+            "type": "user",
+            "timestamp": 1787479200,
+            "message": {"role": "user", "content": "numeric timestamp"},
+        }
+    )
+    old = make_line(
+        {
+            "type": "user",
+            "timestamp": "2026-08-22T23:59:59Z",
+            "message": {"role": "user", "content": "old event"},
+        }
+    )
+    recent_signals = signals_from_event(
+        recent,
+        runtime="claude",
+        session_id="session-1",
+        source_line=1,
+        scope=scope,
+    )
+    assert recent_signals[0].timestamp.tzinfo is timezone.utc
+    assert signals_from_event(
+        old,
+        runtime="claude",
+        session_id="session-1",
+        source_line=2,
+        scope=scope,
+    ) == ()
+
+
+def test_malformed_input_writes_incomplete_manifest_before_raising():
+    with TemporaryDirectory() as raw:
+        root = Path(raw)
+        source_root = root / "projects" / "project-a"
+        source_root.mkdir(parents=True)
+        (source_root / "broken.jsonl").write_text("{not valid json\n")
+        spec = resolve_runtime("claude", home=root, env={}, source_root=source_root.parent)
+        scope = Scope(datetime(2026, 8, 23, tzinfo=timezone.utc), None, False)
+        try:
+            run_digest(spec, scope, root / "out")
+        except IncompleteDigestError as exc:
+            assert exc.manifest.complete is False
+            source = exc.manifest.source_files[0]
+            assert source.malformed_lines == 1
+            assert source.readable is True
+            assert json.loads((root / "out" / "manifest.json").read_text())["complete"] is False
+        else:
+            raise AssertionError("malformed input must fail after writing the manifest")
+
+
+def test_non_empty_output_directory_is_rejected_without_overwriting():
+    with TemporaryDirectory() as raw:
+        root = Path(raw)
+        source_root = root / "projects"
+        source_root.mkdir(parents=True)
+        out_dir = root / "out"
+        out_dir.mkdir()
+        sentinel = out_dir / "sentinel"
+        sentinel.write_text("keep me")
+        spec = resolve_runtime("claude", home=root, env={}, source_root=source_root)
+        scope = Scope(datetime(2026, 8, 23, tzinfo=timezone.utc), None, False)
+        try:
+            run_digest(spec, scope, out_dir)
+        except FileExistsError:
+            assert sentinel.read_text() == "keep me"
+        else:
+            raise AssertionError("non-empty output directories must be rejected")
+
+
+def test_codex_run_filters_subagent_threads_and_records_manifest_paths():
+    with TemporaryDirectory() as raw:
+        root = Path(raw)
+        source_root = root / "sessions"
+        source_root.mkdir()
+        canonical = source_root / "canonical.jsonl"
+        canonical.write_text(
+            make_line(
+                {
+                    "type": "session_meta",
+                    "timestamp": "2026-08-23T09:00:00Z",
+                    "payload": {"id": "user-1", "thread_source": "user", "project": "project__with__underscores", "cwd": "/tmp/ignored"},
+                }
+            )
+            + make_line(
+                {
+                    "type": "event_msg",
+                    "timestamp": "2026-08-23T10:00:00Z",
+                    "payload": {"type": "user_message", "message": "canonical user"},
+                }
+            )
+        )
+        subagent = source_root / "subagent.jsonl"
+        subagent.write_text(
+            make_line(
+                {
+                    "type": "session_meta",
+                    "timestamp": "2026-08-23T09:00:00Z",
+                    "payload": {"id": "agent-1", "thread_source": "subagent", "project": "project__with__underscores", "cwd": "/tmp/ignored"},
+                }
+            )
+            + make_line(
+                {
+                    "type": "event_msg",
+                    "timestamp": "2026-08-23T10:00:00Z",
+                    "payload": {"type": "user_message", "message": "subagent user"},
+                }
+            )
+        )
+        spec = resolve_runtime("codex", home=root, env={}, source_root=source_root)
+        scope = Scope(datetime(2026, 8, 23, tzinfo=timezone.utc), None, False)
+        manifest = run_digest(spec, scope, root / "out")
+        assert manifest.sessions_scanned == 2
+        assert manifest.sessions_with_signals == 1
+        assert manifest.signal_counts["user"] == 1
+        assert [source.source_path for source in manifest.source_files] == [
+            "canonical.jsonl",
+            "subagent.jsonl",
+        ]
+        assert manifest.source_files[0].digest_path is not None
+        assert manifest.source_files[1].digest_path is None
+        assert manifest.source_files[0].project == "project__with__underscores"
+        assert json.loads((root / "out" / "manifest.json").read_text())["source_files"][0]["project"] == "project__with__underscores"
+        assert "# project: project__with__underscores" in next((root / "out").glob("*.md")).read_text()
+        assert json.loads((root / "out" / "manifest.json").read_text())["runtime"] == "codex"
+
+
+def test_codex_user_without_project_or_cwd_keeps_signal_and_manifest_project():
+    with TemporaryDirectory() as raw:
+        root = Path(raw)
+        source_root = root / "sessions" / "2026" / "08" / "23"
+        source_root.mkdir(parents=True)
+        (source_root / "canonical.jsonl").write_text(
+            make_line(
+                {
+                    "type": "session_meta",
+                    "timestamp": "2026-08-23T09:00:00Z",
+                    "payload": {"id": "user-1", "thread_source": "user"},
+                }
+            )
+            + make_line(
+                {
+                    "type": "event_msg",
+                    "timestamp": "2026-08-23T10:00:00Z",
+                    "payload": {"type": "user_message", "message": "canonical user"},
+                }
+            )
+        )
+        spec = resolve_runtime("codex", home=root, env={}, source_root=root / "sessions")
+        scope = Scope(datetime(2026, 8, 23, tzinfo=timezone.utc), None, False)
+        manifest = run_digest(spec, scope, root / "out")
+        expected_project = "codex:2026/08/23/canonical.jsonl"
+        source = manifest.source_files[0]
+        assert manifest.sessions_with_signals == 1
+        assert manifest.signal_counts["user"] == 1
+        assert source.project == expected_project
+        persisted = json.loads((root / "out" / "manifest.json").read_text())
+        assert persisted["source_files"][0]["project"] == expected_project
+
+
+def test_codex_missing_or_invalid_session_metadata_is_recorded_as_incomplete():
+    for filename, content in (
+        ("malformed.jsonl", "{not valid json\n"),
+        ("missing-meta.jsonl", '{"type":"event_msg","timestamp":"2026-08-23T10:00:00Z"}\n'),
+        ("invalid-meta.jsonl", '{"type":"session_meta","payload":{"thread_source":"user"}}\n'),
+    ):
+        with TemporaryDirectory() as raw:
+            root = Path(raw)
+            source_root = root / "sessions"
+            source_root.mkdir()
+            (source_root / filename).write_text(content)
+            spec = resolve_runtime("codex", home=root, env={}, source_root=source_root)
+            scope = Scope(datetime(2026, 8, 23, tzinfo=timezone.utc), None, False)
+            try:
+                run_digest(spec, scope, root / "out")
+            except IncompleteDigestError as exc:
+                assert exc.manifest.sessions_scanned == 1
+                assert exc.manifest.complete is False
+                source = exc.manifest.source_files[0]
+                assert source.source_path == filename
+                if filename == "malformed.jsonl":
+                    assert source.malformed_lines == 1
+            else:
+                raise AssertionError("invalid Codex metadata must fail closed")
+
+
+def test_codex_subagents_path_is_filtered_only_when_subagents_are_excluded():
+    with TemporaryDirectory() as raw:
+        root = Path(raw)
+        source_root = root / "sessions"
+        nested = source_root / "subagents"
+        nested.mkdir(parents=True)
+        canonical_line = make_line(
+            {
+                "type": "session_meta",
+                "timestamp": "2026-08-23T09:00:00Z",
+                "payload": {"id": "user-1", "thread_source": "user", "project": "project-a"},
+            }
+        ) + make_line(
+            {
+                "type": "event_msg",
+                "timestamp": "2026-08-23T10:00:00Z",
+                "payload": {"type": "user_message", "message": "canonical user"},
+            }
+        )
+        subagent_line = canonical_line.replace("user-1", "nested-user-1").replace(
+            "canonical user", "nested path user"
+        )
+        (source_root / "canonical.jsonl").write_text(canonical_line)
+        (nested / "foo.jsonl").write_text(subagent_line)
+        spec = resolve_runtime("codex", home=root, env={}, source_root=source_root)
+
+        default = run_digest(
+            spec,
+            Scope(datetime(2026, 8, 23, tzinfo=timezone.utc), None, False),
+            root / "default-out",
+        )
+        assert default.sessions_scanned == 2
+        assert default.sessions_with_signals == 1
+        assert default.source_files[1].source_path == "subagents/foo.jsonl"
+        assert default.source_files[1].digest_path is None
+
+        included = run_digest(
+            spec,
+            Scope(datetime(2026, 8, 23, tzinfo=timezone.utc), None, True),
+            root / "included-out",
+        )
+        assert included.sessions_scanned == 2
+        assert included.sessions_with_signals == 2
+        assert included.source_files[1].digest_path is not None
+
+
 def test_end_to_end_writes_digest_and_skips_empty_and_memory():
     tmp = tempfile.mkdtemp()
     try:
@@ -132,12 +751,12 @@ def test_end_to_end_writes_digest_and_skips_empty_and_memory():
         os.makedirs(proj_a)
         with_signal = os.path.join(proj_a, "session-with-signal.jsonl")
         with open(with_signal, "w") as fh:
-            fh.write(make_line({"type": "user", "timestamp": "t1", "message": {"role": "user", "content": "hello"}}))
+            fh.write(make_line({"type": "user", "timestamp": "2026-08-23T10:00:00Z", "message": {"role": "user", "content": "hello"}}))
             fh.write(
                 make_line(
                     {
                         "type": "assistant",
-                        "timestamp": "t2",
+                        "timestamp": "2026-08-23T10:01:00Z",
                         "message": {"role": "assistant", "content": [{"type": "text", "text": "hi there"}]},
                     }
                 )
@@ -149,7 +768,7 @@ def test_end_to_end_writes_digest_and_skips_empty_and_memory():
                 make_line(
                     {
                         "type": "assistant",
-                        "timestamp": "t3",
+                        "timestamp": "2026-08-23T10:02:00Z",
                         "message": {"role": "assistant", "content": [{"type": "text", "text": "just thinking"}]},
                     }
                 )
@@ -159,20 +778,42 @@ def test_end_to_end_writes_digest_and_skips_empty_and_memory():
         memory_dir = os.path.join(proj_a, "memory")
         os.makedirs(memory_dir)
         with open(os.path.join(memory_dir, "session-in-memory.jsonl"), "w") as fh:
-            fh.write(make_line({"type": "user", "timestamp": "t4", "message": {"role": "user", "content": "secret"}}))
+            fh.write(make_line({"type": "user", "timestamp": "2026-08-23T10:03:00Z", "message": {"role": "user", "content": "secret"}}))
 
-        scanned, written, n_projects, counts = digest.run(projects_dir, since_days=3650, out_dir=out_dir, project_filter=None)
+        spec = resolve_runtime("claude", home=Path(tmp), env={}, source_root=Path(projects_dir))
+        manifest = run_digest(
+            spec,
+            Scope(datetime(2026, 8, 23, tzinfo=timezone.utc), None, False),
+            Path(out_dir),
+        )
 
-        assert scanned == 2, scanned  # memory session never yielded
-        assert written == 1, written
-        assert n_projects == 1, n_projects
-        assert counts["user"] == 1, counts
-
+        assert manifest.sessions_scanned == 2, manifest
+        assert manifest.sessions_with_signals == 1
+        assert manifest.signal_counts["user"] == 1
         digest_files = os.listdir(out_dir)
-        assert len(digest_files) == 1, digest_files
-        assert digest_files[0] == "proj-a__session-with-signal.md", digest_files
+        assert len([name for name in digest_files if name.endswith(".md")]) == 1, digest_files
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_legacy_digest_cli_fails_closed_and_points_to_typed_entrypoint():
+    completed = __import__("subprocess").run(
+        [os.sys.executable, "scripts/digest.py", "--projects-dir", "/tmp", "--out", "/tmp/reflect-setup-test"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode != 0
+    assert "reflect_setup.py" in completed.stderr
+
+
+def test_legacy_digest_writer_is_unavailable():
+    try:
+        digest.run("/tmp", 30, "/tmp/reflect-setup-test", None)
+    except LegacyDigestWorkflowError as exc:
+        assert "typed" in str(exc)
+    else:
+        raise AssertionError("legacy digest workflow must not remain callable")
 
 
 def main():
