@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Runnable checks for inventory coverage states."""
 from coverage_model import CoverageRecord, Inventory, InventoryItem, assess_coverage
+from miner_contract import EvidenceRef
 from test_support import make_evidence
 
 
@@ -51,6 +52,39 @@ def test_recurrence_is_negative_prevention_evidence():
         symptom_recurred=True,
     )
     assert record.prevented is False
+
+
+def test_reusing_the_same_evidence_cannot_prove_prevention():
+    evidence = make_evidence("session.md", 8, "outcome")
+    record = assess_coverage(
+        artifact_id="skill:reflect-setup",
+        artifact_kind="skill",
+        exists=True,
+        eligible=True,
+        trigger_evidence=(evidence,),
+        prevention_evidence=(evidence,),
+        symptom_recurred=False,
+    )
+    assert isinstance(evidence, EvidenceRef)
+    assert record.triggered is True
+    assert record.prevented is None
+
+
+def test_coverage_rejects_untyped_evidence():
+    try:
+        assess_coverage(
+            artifact_id="skill:reflect-setup",
+            artifact_kind="skill",
+            exists=True,
+            eligible=True,
+            trigger_evidence=(object(),),
+            prevention_evidence=(),
+            symptom_recurred=False,
+        )
+    except TypeError as exc:
+        assert "EvidenceRef" in str(exc)
+    else:
+        raise AssertionError("untyped coverage evidence must fail")
 
 
 def test_inventory_records_declared_artifacts_and_paths():

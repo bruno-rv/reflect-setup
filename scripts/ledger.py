@@ -3,13 +3,17 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import re
 import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Mapping
+
+from miner_contract import EvidenceRef, Finding
 
 
 def _frozen_dataclass(cls):
@@ -47,6 +51,21 @@ _ENTRY_START = re.compile(r"^(\s*)-\s+(.*)$")
 _PROPERTY = re.compile(r"^  ([A-Za-z_][A-Za-z0-9_-]*)\s*:\s*(.*?)\s*$")
 _DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _INT = re.compile(r"^[+-]?\d+$")
+_ID = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+_ALLOWED_FIELDS = frozenset(
+    {
+        "id",
+        "title",
+        "status",
+        "first_seen",
+        "last_seen",
+        "sessions",
+        "projects",
+        "evidence",
+        "fix",
+        "wired_check",
+    }
+)
 _REQUIRED_WIRED_CHECK = frozenset(
     {
         LedgerStatus.FIX_APPLIED,
@@ -175,11 +194,16 @@ def _parse_value(raw: str, label: str) -> Any:
 
 def _validate_fields(fields: Mapping[str, tuple[int, Any, str]], entry_index: int) -> LedgerEntry:
     prefix = f"entry {entry_index}"
+    unknown_fields = sorted(set(fields) - _ALLOWED_FIELDS)
+    if unknown_fields:
+        raise LedgerParseError(f"{prefix} has unknown fields: {', '.join(unknown_fields)}")
     if "id" not in fields:
         raise LedgerParseError(f"{prefix} is missing id")
     cluster_id = fields["id"][1]
     if not isinstance(cluster_id, str) or not cluster_id.strip():
         raise LedgerParseError(f"{prefix} id must be a non-empty string")
+    if not _ID.fullmatch(cluster_id.strip()):
+        raise LedgerParseError(f"{prefix} id must be a stable kebab-slug")
     if "status" not in fields:
         raise LedgerParseError(f"{prefix} is missing status")
     raw_status = fields["status"][1]
@@ -321,7 +345,7 @@ def validate_transition(current: LedgerStatus, verification: Any) -> LedgerStatu
             return LedgerStatus.BUILT_NOT_OPERATING
         return LedgerStatus.RESOLVED
     if current is LedgerStatus.RESOLVED:
-        return LedgerStatus.BUILT_NOT_OPERATING if symptom == "fail" else LedgerStatus.RESOLVED
+        return LedgerStatus.BUILT_NOT_OPERATING if operating_failure else LedgerStatus.RESOLVED
     return current
 
 
@@ -400,14 +424,25 @@ def _replace_field(lines: list[str], block: _LedgerBlock, key: str, value: Any) 
 
 def _status_update(current: LedgerStatus, update: Any) -> tuple[LedgerStatus | None, str | None]:
     if isinstance(update, LedgerEntry):
+        if (
+            update.status is not current
+            and (current in _REQUIRED_WIRED_CHECK or update.status in _REQUIRED_WIRED_CHECK)
+        ):
+            raise LedgerTransitionError("operating-state updates require explicit verification")
         return update.status, update.wired_check or None
     if isinstance(update, LedgerStatus):
+        if (
+            update is not current
+            and (current in _REQUIRED_WIRED_CHECK or update in _REQUIRED_WIRED_CHECK)
+        ):
+            raise LedgerTransitionError("operating-state updates require explicit verification")
         return update, None
     if isinstance(update, str):
         try:
-            return LedgerStatus(update), None
+            target = LedgerStatus(update)
         except ValueError as exc:
             raise LedgerTransitionError(f"unknown requested ledger status: {update!r}") from exc
+        return _status_update(current, target)
     if hasattr(update, "symptom") and hasattr(update, "invocation") and hasattr(update, "outcome"):
         return validate_transition(current, update), None
     if isinstance(update, tuple) and len(update) == 2:
@@ -420,13 +455,50 @@ def _status_update(current: LedgerStatus, update: Any) -> tuple[LedgerStatus | N
     raise LedgerTransitionError(f"unsupported ledger update for {current.value}")
 
 
-def _group_findings(findings: Iterable[Any]) -> dict[str, list[Any]]:
-    grouped: dict[str, list[Any]] = {}
+def _group_findings(findings: Iterable[Finding]) -> dict[str, list[Finding]]:
+    grouped: dict[str, list[Finding]] = {}
     for finding in findings:
+        if not isinstance(finding, Finding):
+            raise TypeError("merged_findings must contain Finding instances")
+        for evidence in finding.evidence:
+            if not isinstance(evidence, EvidenceRef):
+                raise TypeError("Finding.evidence must contain EvidenceRef instances")
         cluster_key = _finding_cluster_key(finding)
         if cluster_key:
             grouped.setdefault(cluster_key, []).append(finding)
     return grouped
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    """Replace a ledger atomically using a flushed same-directory temporary."""
+    temporary_name: str | None = None
+    descriptor: int | None = None
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.",
+            dir=str(path.parent),
+            text=True,
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as stream:
+            descriptor = None
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_name, path)
+        temporary_name = None
+    except OSError as exc:
+        raise LedgerParseError(f"cannot atomically write ledger {path}: {exc}") from exc
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if temporary_name is not None:
+            try:
+                os.unlink(temporary_name)
+            except OSError:
+                pass
 
 
 def update_ledger(
@@ -506,8 +578,10 @@ def update_ledger(
                     raise LedgerParseError(f"ledger entry {cluster_id} sessions must be an integer")
                 _replace_field(lines, block, "sessions", old_count + len(new_sessions))
             first_seen, last_seen = _finding_dates(findings)
-            if first_seen is not None and "first_seen" not in block.fields:
-                _replace_field(lines, block, "first_seen", first_seen)
+            if first_seen is not None:
+                previous_first_seen = block.fields.get("first_seen", (0, None, ""))[1]
+                if not isinstance(previous_first_seen, date) or first_seen < previous_first_seen:
+                    _replace_field(lines, block, "first_seen", first_seen)
             candidate_last_seen = explicit_date or last_seen
             if candidate_last_seen is not None:
                 previous_last_seen = block.fields.get("last_seen", (0, None, ""))[1]
@@ -519,10 +593,7 @@ def update_ledger(
     # invalid ledger behind (especially for required wired_check fields).
     _parse_document(updated)
     if path is not None:
-        try:
-            path.write_text(updated, encoding="utf-8")
-        except OSError as exc:
-            raise LedgerParseError(f"cannot write ledger {path}: {exc}") from exc
+        _atomic_write(path, updated)
     return updated
 
 

@@ -59,13 +59,27 @@ def assess_coverage(
     """
     trigger_refs = tuple(trigger_evidence)
     prevention_refs = tuple(prevention_evidence)
+    trigger_keys: set[tuple[str, int]] = set()
+    for ref in trigger_refs:
+        if not isinstance(ref, EvidenceRef):
+            raise TypeError("trigger_evidence must contain EvidenceRef instances")
+        trigger_keys.add((ref.digest_path, ref.source_line))
+    prevention_keys: set[tuple[str, int]] = set()
+    for ref in prevention_refs:
+        if not isinstance(ref, EvidenceRef):
+            raise TypeError("prevention_evidence must contain EvidenceRef instances")
+        prevention_keys.add((ref.digest_path, ref.source_line))
+    independent = not trigger_keys.intersection(prevention_keys)
     triggered = bool(trigger_refs)
     if symptom_recurred:
         prevented: bool | None = False
         result_detail = "symptom recurred"
-    elif triggered and prevention_refs:
+    elif triggered and prevention_refs and independent:
         prevented = True
         result_detail = "triggered and independent outcome passed"
+    elif trigger_refs and prevention_refs:
+        prevented = None
+        result_detail = "outcome evidence is not independent"
     else:
         prevented = None
         result_detail = "outcome evidence insufficient"
