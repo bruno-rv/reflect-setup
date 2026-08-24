@@ -95,7 +95,21 @@ def test_batch_coverage_requires_two_disjoint_exhaustive_reports():
         raise AssertionError("missing batch partitions must raise")
 
 
-def _manifest_for_batch_test():
+def test_batch_coverage_rejects_non_overlapping_reports_missing_one_of_three_paths():
+    manifest = _manifest_for_batch_test(paths=("a", "b", "c"))
+    reports = (
+        MinerReport(1, Runtime.CLAUDE, "batch-run", "part-a", ("a.md",), (), ()),
+        MinerReport(1, Runtime.CLAUDE, "batch-run", "part-b", ("b.md",), (), ()),
+    )
+    try:
+        validate_batch_coverage(manifest, reports)
+    except BatchCoverageError as exc:
+        assert "c.md" in str(exc)
+    else:
+        raise AssertionError("non-overlapping but incomplete partitions must raise")
+
+
+def _manifest_for_batch_test(paths=("a", "b")):
     from digest import DigestManifest, SourceFile
 
     return DigestManifest(
@@ -103,13 +117,24 @@ def _manifest_for_batch_test():
         run_id="batch-run",
         runtime=Runtime.CLAUDE,
         scope=Scope(datetime(2026, 8, 23, tzinfo=timezone.utc), None, False),
-        source_files=(
-            SourceFile("a.jsonl", "0" * 64, True, True, 1, 0, 0, 1, "fixture-a", "a.md"),
-            SourceFile("b.jsonl", "1" * 64, True, True, 1, 0, 0, 1, "fixture-b", "b.md"),
+        source_files=tuple(
+            SourceFile(
+                f"{path}.jsonl",
+                str(index) * 64,
+                True,
+                True,
+                1,
+                0,
+                0,
+                1,
+                f"fixture-{path}",
+                f"{path}.md",
+            )
+            for index, path in enumerate(paths)
         ),
-        sessions_scanned=2,
-        sessions_with_signals=2,
-        signal_counts={"user": 2},
+        sessions_scanned=len(paths),
+        sessions_with_signals=len(paths),
+        signal_counts={"user": len(paths)},
         complete=True,
     )
 
@@ -121,6 +146,7 @@ if __name__ == "__main__":
         test_evaluation_detects_nondeterministic_ranking,
         test_in_scope_malformed_json_preserves_incomplete_manifest_evidence,
         test_batch_coverage_requires_two_disjoint_exhaustive_reports,
+        test_batch_coverage_rejects_non_overlapping_reports_missing_one_of_three_paths,
     )
     for test in tests:
         test()
