@@ -2,7 +2,14 @@
 import json
 from datetime import datetime, timezone
 
-from miner_contract import ReportValidationError, merge_reports, parse_report
+from miner_contract import (
+    Finding,
+    FindingType,
+    MinerReport,
+    ReportValidationError,
+    merge_reports,
+    parse_report,
+)
 from test_support import make_batch, make_manifest, make_report
 
 
@@ -53,6 +60,35 @@ def test_valid_report_preserves_typed_evidence():
     report = parse_report(raw, manifest, batch)
     assert report.findings[0].evidence[0].source_line == 4
     assert report.findings[0].confidence == 0.9
+
+
+def test_report_accepts_strict_rfc3339_z_and_numeric_offset():
+    manifest, batch = manifest_and_batch()
+    for timestamp, expected in (
+        ("2026-08-23T10:00:00Z", datetime(2026, 8, 23, 10, tzinfo=timezone.utc)),
+        ("2026-08-23T12:30:45+02:30", datetime(2026, 8, 23, 10, 0, 45, tzinfo=timezone.utc)),
+    ):
+        payload = valid_payload()
+        payload["findings"][0]["evidence"][0]["timestamp"] = timestamp
+        report = parse_report(json.dumps(payload), manifest, batch)
+        assert report.findings[0].evidence[0].timestamp == expected
+
+
+def test_report_rejects_rfc3339_near_misses():
+    manifest, batch = manifest_and_batch()
+    for timestamp in (
+        "2026-08-23 10:00:00Z",
+        "2026-08-23T10:00Z",
+        "2026-08-23T10:00:00",
+    ):
+        payload = valid_payload()
+        payload["findings"][0]["evidence"][0]["timestamp"] = timestamp
+        try:
+            parse_report(json.dumps(payload), manifest, batch)
+        except ReportValidationError:
+            pass
+        else:
+            raise AssertionError(f"timestamp near-miss must fail: {timestamp}")
 
 
 def test_report_rejects_evidence_from_another_batch():
@@ -150,6 +186,26 @@ def test_merge_rejects_duplicate_batch_ids():
         assert "duplicate" in str(exc)
     else:
         raise AssertionError("duplicate batch IDs must fail closed")
+
+
+def test_merge_rejects_typed_finding_without_evidence():
+    manifest = make_manifest(run_id="run-1", files=("a.md",))
+    finding = Finding(
+        cluster_key="fixture",
+        finding_type=FindingType.FAILURE,
+        session_id="session-a",
+        paraphrase="fixture failure",
+        occurrence_count=1,
+        confidence=0.5,
+        evidence=(),
+    )
+    report = MinerReport(1, "claude", "run-1", "batch-1", ("a.md",), (finding,), ())
+    try:
+        merge_reports((report,), manifest)
+    except ReportValidationError as exc:
+        assert "evidence" in str(exc)
+    else:
+        raise AssertionError("typed findings without evidence must fail closed")
 
 
 def test_merge_sums_distinct_evidence_and_sorts_clusters():

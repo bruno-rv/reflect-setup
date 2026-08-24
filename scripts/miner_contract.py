@@ -31,6 +31,9 @@ _FINDING_FIELDS = frozenset(
     }
 )
 _EVIDENCE_FIELDS = frozenset({"digest_path", "source_line", "timestamp", "kind"})
+_RFC3339_DATETIME = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
+)
 
 
 def _frozen_dataclass(cls):
@@ -136,9 +139,9 @@ def _runtime(value: Any, label: str) -> Runtime:
 
 
 def _timestamp(value: Any, label: str) -> datetime:
-    if not isinstance(value, str) or not value.strip():
+    if not isinstance(value, str) or not _RFC3339_DATETIME.fullmatch(value):
         _fail(f"{label} must be an RFC 3339 timestamp")
-    text = value.strip()
+    text = value
     if text.endswith("Z"):
         text = text[:-1] + "+00:00"
     try:
@@ -319,6 +322,52 @@ def parse_report(raw: str, manifest: DigestManifest, batch: BatchSpec) -> MinerR
     return MinerReport(1, runtime, run_id, batch_id, digest_paths, findings, themes)
 
 
+def _validate_typed_finding(
+    finding: Finding,
+    *,
+    report_paths: tuple[str, ...],
+    manifest_paths: frozenset[str],
+    label: str,
+) -> None:
+    if not isinstance(finding.finding_type, FindingType):
+        _fail(f"{label} has an invalid finding type")
+    _non_empty_string(finding.cluster_key, f"{label}.cluster_key")
+    _non_empty_string(finding.session_id, f"{label}.session_id")
+    _non_empty_string(finding.paraphrase, f"{label}.paraphrase", one_line=True)
+    if (
+        isinstance(finding.occurrence_count, bool)
+        or not isinstance(finding.occurrence_count, int)
+        or finding.occurrence_count <= 0
+    ):
+        _fail(f"{label}.occurrence_count must be a positive integer")
+    if isinstance(finding.confidence, bool) or not isinstance(finding.confidence, (int, float)):
+        _fail(f"{label}.confidence must be a number between 0 and 1")
+    if not math.isfinite(float(finding.confidence)) or not 0 <= finding.confidence <= 1:
+        _fail(f"{label}.confidence must be a number between 0 and 1")
+    if not isinstance(finding.evidence, (tuple, list)) or not finding.evidence:
+        _fail(f"{label}.evidence must contain at least one reference")
+    seen = set()
+    for evidence_index, ref in enumerate(finding.evidence):
+        evidence_label = f"{label}.evidence[{evidence_index}]"
+        if not isinstance(ref, EvidenceRef):
+            _fail(f"{evidence_label} is invalid")
+        digest_path = _non_empty_string(ref.digest_path, f"{evidence_label}.digest_path")
+        if digest_path not in manifest_paths:
+            _fail(f"{evidence_label}.digest_path is missing from manifest: {digest_path}")
+        if digest_path not in report_paths:
+            _fail(f"{evidence_label}.digest_path is outside assigned batch: {digest_path}")
+        if isinstance(ref.source_line, bool) or not isinstance(ref.source_line, int) or ref.source_line <= 0:
+            _fail(f"{evidence_label}.source_line must be a positive integer")
+        if not isinstance(ref.timestamp, datetime) or ref.timestamp.tzinfo is None:
+            _fail(f"{evidence_label}.timestamp must include a timezone")
+        if not isinstance(ref.kind, FindingType) or ref.kind is not finding.finding_type:
+            _fail(f"{evidence_label}.kind must match finding_type")
+        key = _evidence_key(ref)
+        if key in seen:
+            continue
+        seen.add(key)
+
+
 def _typed_report_paths(report: MinerReport, manifest: DigestManifest) -> tuple[str, ...]:
     if not isinstance(report, MinerReport):
         _fail("merge_reports expects MinerReport values")
@@ -327,36 +376,34 @@ def _typed_report_paths(report: MinerReport, manifest: DigestManifest) -> tuple[
     runtime = report.runtime if isinstance(report.runtime, Runtime) else _runtime(report.runtime, "report.runtime")
     if runtime is not manifest.runtime:
         _fail(f"report {report.batch_id!r} runtime does not match manifest")
+    if not isinstance(report.batch_id, str) or not report.batch_id.strip():
+        _fail("report.batch_id must be a non-empty string")
+    if not isinstance(report.run_id, str) or not report.run_id.strip():
+        _fail("report.run_id must be a non-empty string")
     if report.run_id != manifest.run_id:
         _fail(f"report {report.batch_id!r} run_id does not match manifest")
+    if not isinstance(report.digest_paths, (tuple, list)):
+        _fail(f"report {report.batch_id!r} digest_paths must be a sequence")
     paths = tuple(report.digest_paths)
+    if any(not isinstance(path, str) or not path.strip() for path in paths):
+        _fail(f"report {report.batch_id!r} digest_paths must contain non-empty strings")
     if len(set(paths)) != len(paths):
         _fail(f"report {report.batch_id!r} has duplicate digest paths")
     manifest_paths = _manifest_paths(manifest)
     unknown = sorted(set(paths) - manifest_paths)
     if unknown:
         _fail(f"report digest path is missing from manifest: {', '.join(unknown)}")
+    if not isinstance(report.findings, (tuple, list)):
+        _fail(f"report {report.batch_id!r} findings must be a sequence")
     for finding_index, finding in enumerate(report.findings):
         if not isinstance(finding, Finding):
             _fail(f"report {report.batch_id!r} has an invalid finding")
-        if not _normalize_cluster_key(finding.cluster_key):
-            _fail("finding.cluster_key must be non-empty")
-        if isinstance(finding.occurrence_count, bool) or finding.occurrence_count <= 0:
-            _fail("finding.occurrence_count must be a positive integer")
-        if not math.isfinite(float(finding.confidence)) or not 0 <= finding.confidence <= 1:
-            _fail("finding.confidence must be a number between 0 and 1")
-        seen = set()
-        for ref in finding.evidence:
-            if not isinstance(ref, EvidenceRef):
-                _fail(f"report finding {finding_index} has invalid evidence")
-            key = _evidence_key(ref)
-            if key in seen:
-                continue
-            seen.add(key)
-            if ref.digest_path not in paths:
-                _fail(f"evidence digest path is outside assigned batch: {ref.digest_path}")
-            if ref.digest_path not in manifest_paths:
-                _fail(f"evidence digest path is missing from manifest: {ref.digest_path}")
+        _validate_typed_finding(
+            finding,
+            report_paths=paths,
+            manifest_paths=manifest_paths,
+            label=f"report finding {finding_index}",
+        )
     return paths
 
 
