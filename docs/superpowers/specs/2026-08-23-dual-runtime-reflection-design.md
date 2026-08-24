@@ -227,9 +227,10 @@ and collectively cover the complete input set.
 
 ## Signal extraction
 
-`scripts/digest.py` retains the existing public compatibility wrapper
-`signals_from_line(raw_line)`, which means current Claude tests remain valid.
-New runtime-aware extraction is exposed as:
+`scripts/digest.py` retains only the existing import-compatibility wrapper
+`signals_from_line(raw_line)`; its retired writer workflow and direct CLI fail
+closed. The public entry point is the typed `scripts/reflect_setup.py`
+manifest workflow. New runtime-aware extraction is exposed as:
 
 ```python
 class SignalKind(str, Enum):
@@ -295,6 +296,8 @@ class EvidenceRef:
     source_line: int
     timestamp: datetime
     kind: FindingType
+    project: str
+    occurrence_count: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -363,7 +366,14 @@ class CoverageRecord:
     prevented: bool | None
     evidence: tuple[EvidenceRef, ...]
     detail: str
+    trigger_evidence: tuple[EvidenceRef, ...]
+    prevention_evidence: tuple[EvidenceRef, ...]
 ```
+
+Hosts supply typed `CoverageObservation` values containing the artifact ID and
+kind, explicit eligibility, trigger evidence, prevention evidence, and symptom
+recurrence. The core validates those IDs/types against the inventory and never
+invents eligibility from declaration state.
 
 `declared` means the artifact exists in a configured inventory location.
 `eligible` means the runtime's trigger and scope rules would have selected it

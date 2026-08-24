@@ -184,15 +184,21 @@ def _preview_paths(preview: ApplyPreview) -> tuple[Path, ...]:
 
 
 def check_scope_overlap(first: ApplyPreview, second: ApplyPreview) -> tuple[str, str] | None:
-    """Return both cluster ids when two approved previews share a real path."""
+    """Return both cluster ids when two approved scopes intersect."""
     first_paths = _preview_paths(first)
     second_paths = _preview_paths(second)
     first_root = _root(first.workspace_state)
     second_root = _root(second.workspace_state)
-    first_absolute = {first_root / path for path in first_paths}
-    second_absolute = {second_root / path for path in second_paths}
-    if first_absolute.intersection(second_absolute):
-        return (first.request.cluster_id, second.request.cluster_id)
+    first_absolute = tuple(first_root / path for path in first_paths)
+    second_absolute = tuple(second_root / path for path in second_paths)
+    for first_path in first_absolute:
+        for second_path in second_absolute:
+            if (
+                first_path == second_path
+                or first_path in second_path.parents
+                or second_path in first_path.parents
+            ):
+                return (first.request.cluster_id, second.request.cluster_id)
     return None
 
 

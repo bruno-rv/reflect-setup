@@ -235,6 +235,53 @@ def test_merge_sums_distinct_evidence_and_sorts_clusters():
     assert merged[0].confidence == 0.5
 
 
+def test_merge_rejects_aggregate_count_not_matching_explicit_evidence_counts():
+    manifest = make_manifest(
+        run_id="run-1",
+        files=("a.md", "b.md"),
+        projects=(("a.md", "project-a"), ("b.md", "project-a")),
+    )
+    timestamp = datetime(2026, 8, 23, tzinfo=timezone.utc)
+    finding = Finding(
+        "fixture", FindingType.FAILURE, "session-a", "first", 4, 0.8,
+        (
+            EvidenceRef("a.md", 1, timestamp, FindingType.FAILURE, "project-a", 2),
+            EvidenceRef("b.md", 1, timestamp, FindingType.FAILURE, "project-a", 1),
+        ),
+    )
+    report = MinerReport(1, "claude", "run-1", "batch-1", ("a.md", "b.md"), (finding,), ())
+    try:
+        merge_reports((report,), manifest)
+    except ReportValidationError as exc:
+        assert "occurrence" in str(exc)
+    else:
+        raise AssertionError("aggregate count must match explicit evidence counts")
+
+
+def test_merge_counts_only_distinct_evidence_when_findings_partially_overlap():
+    manifest = make_manifest(
+        run_id="run-1",
+        files=("a.md", "b.md"),
+        projects=(("a.md", "project-a"), ("b.md", "project-a")),
+    )
+    timestamp = datetime(2026, 8, 23, tzinfo=timezone.utc)
+    first = Finding(
+        "fixture", FindingType.FAILURE, "session-a", "first", 3, 0.8,
+        (
+            EvidenceRef("a.md", 1, timestamp, FindingType.FAILURE, "project-a", 2),
+            EvidenceRef("b.md", 1, timestamp, FindingType.FAILURE, "project-a", 1),
+        ),
+    )
+    second = Finding(
+        "fixture", FindingType.FAILURE, "session-a", "second", 2, 0.7,
+        (EvidenceRef("a.md", 1, timestamp, FindingType.FAILURE, "project-a", 2),),
+    )
+    report = MinerReport(1, "claude", "run-1", "batch-a", ("a.md", "b.md"), (first, second), ())
+    merged = merge_reports((report,), manifest)
+    assert merged[0].occurrence_count == 3
+    assert sum(ref.occurrence_count for ref in merged[0].evidence) == 3
+
+
 def test_merge_preserves_distinct_sessions_and_finding_types():
     manifest = make_manifest(
         run_id="run-1",

@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """Runnable checks for inventory coverage states."""
-from coverage_model import CoverageRecord, Inventory, InventoryItem, assess_coverage
+from coverage_model import (
+    CoverageObservation,
+    CoverageRecord,
+    Inventory,
+    InventoryItem,
+    assess_coverage,
+)
+from test_support import make_evidence
 from miner_contract import EvidenceRef
 from test_support import make_evidence
 
@@ -91,6 +98,40 @@ def test_inventory_records_declared_artifacts_and_paths():
     item = InventoryItem("skill:reflect-setup", "skill", "SKILL.md", True)
     inventory = Inventory((item,))
     assert inventory.items == (item,)
+
+
+def test_host_observation_is_typed_and_preserves_explicit_eligibility():
+    triggered = make_evidence("trigger.md", project="fixture-project")
+    prevented = make_evidence("prevented.md", project="fixture-project")
+    observation = CoverageObservation(
+        artifact_id="skill:fixture",
+        artifact_kind="skill",
+        eligible=True,
+        trigger_evidence=(triggered,),
+        prevention_evidence=(prevented,),
+        symptom_recurred=False,
+    )
+    record = assess_coverage(observation=observation, exists=True)
+    assert record.eligible is True
+    assert record.triggered is True
+    assert record.trigger_evidence == (triggered,)
+    assert record.prevention_evidence == (prevented,)
+
+
+def test_host_observation_rejects_unknown_artifact_type():
+    try:
+        CoverageObservation(
+            artifact_id="skill:fixture",
+            artifact_kind="",
+            eligible=True,
+            trigger_evidence=(),
+            prevention_evidence=(),
+            symptom_recurred=False,
+        )
+    except ValueError as exc:
+        assert "artifact_kind" in str(exc)
+    else:
+        raise AssertionError("empty artifact kinds must fail closed")
 
 
 def run_all():

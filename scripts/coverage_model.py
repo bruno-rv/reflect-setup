@@ -25,6 +25,39 @@ class CoverageRecord:
     prevented: bool | None
     evidence: tuple[EvidenceRef, ...]
     detail: str
+    trigger_evidence: tuple[EvidenceRef, ...] = ()
+    prevention_evidence: tuple[EvidenceRef, ...] = ()
+
+
+@_frozen_dataclass
+class CoverageObservation:
+    """Typed host evidence for one declared runtime artifact.
+
+    The host owns eligibility, invocation, and independent outcome collection;
+    the Python core only validates the observation and derives its record.
+    """
+
+    artifact_id: str
+    artifact_kind: str
+    eligible: bool
+    trigger_evidence: tuple[EvidenceRef, ...]
+    prevention_evidence: tuple[EvidenceRef, ...]
+    symptom_recurred: bool
+
+    def __post_init__(self):
+        if not isinstance(self.artifact_id, str) or not self.artifact_id.strip():
+            raise ValueError("artifact_id must be a non-empty string")
+        if not isinstance(self.artifact_kind, str) or not self.artifact_kind.strip():
+            raise ValueError("artifact_kind must be a non-empty string")
+        for name in ("eligible", "symptom_recurred"):
+            if not isinstance(getattr(self, name), bool):
+                raise TypeError(f"{name} must be a bool")
+        for name in ("trigger_evidence", "prevention_evidence"):
+            values = getattr(self, name)
+            if not isinstance(values, (tuple, list)):
+                raise TypeError(f"{name} must be a sequence of EvidenceRef")
+            if any(not isinstance(value, EvidenceRef) for value in values):
+                raise TypeError(f"{name} must contain EvidenceRef instances")
 
 
 @_frozen_dataclass
@@ -42,13 +75,14 @@ class Inventory:
 
 def assess_coverage(
     *,
-    artifact_id: str,
-    artifact_kind: str,
+    artifact_id: str = "",
+    artifact_kind: str = "",
     exists: bool,
-    eligible: bool,
-    trigger_evidence: tuple[EvidenceRef, ...] | list[EvidenceRef],
-    prevention_evidence: tuple[EvidenceRef, ...] | list[EvidenceRef],
-    symptom_recurred: bool,
+    eligible: bool | None = None,
+    trigger_evidence: tuple[EvidenceRef, ...] | list[EvidenceRef] = (),
+    prevention_evidence: tuple[EvidenceRef, ...] | list[EvidenceRef] = (),
+    symptom_recurred: bool = False,
+    observation: CoverageObservation | None = None,
 ) -> CoverageRecord:
     """Separate declaration, eligibility, invocation, and outcome evidence.
 
@@ -57,6 +91,25 @@ def assess_coverage(
     outcome reference.  A recurring symptom is explicit negative evidence and
     takes precedence over any otherwise positive outcome reference.
     """
+    if observation is not None:
+        if not isinstance(observation, CoverageObservation):
+            raise TypeError("observation must be a CoverageObservation")
+        artifact_id = observation.artifact_id
+        artifact_kind = observation.artifact_kind
+        eligible = observation.eligible
+        trigger_evidence = observation.trigger_evidence
+        prevention_evidence = observation.prevention_evidence
+        symptom_recurred = observation.symptom_recurred
+    if not isinstance(artifact_id, str) or not artifact_id.strip():
+        raise ValueError("artifact_id must be a non-empty string")
+    if not isinstance(artifact_kind, str) or not artifact_kind.strip():
+        raise ValueError("artifact_kind must be a non-empty string")
+    if not isinstance(exists, bool):
+        raise TypeError("exists must be a bool")
+    if not isinstance(eligible, bool):
+        raise TypeError("eligible must be a bool")
+    if not isinstance(symptom_recurred, bool):
+        raise TypeError("symptom_recurred must be a bool")
     trigger_refs = tuple(trigger_evidence)
     prevention_refs = tuple(prevention_evidence)
     trigger_keys: set[tuple[str, int]] = set()
@@ -99,10 +152,13 @@ def assess_coverage(
         prevented=prevented,
         evidence=trigger_refs + prevention_refs,
         detail=f"{result_detail}; " + ", ".join(states),
+        trigger_evidence=trigger_refs,
+        prevention_evidence=prevention_refs,
     )
 
 
 __all__ = [
+    "CoverageObservation",
     "CoverageRecord",
     "Inventory",
     "InventoryItem",

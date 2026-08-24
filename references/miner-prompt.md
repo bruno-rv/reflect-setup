@@ -53,7 +53,8 @@ Return exactly one JSON object with exactly these top-level fields:
           "project": "<manifest project>",
           "source_line": 4,
           "timestamp": "2026-08-23T10:00:00Z",
-          "kind": "failure"
+          "kind": "failure",
+          "occurrence_count": 1
         }
       ]
     }
@@ -72,16 +73,19 @@ Rules for the fields:
 - Each finding has exactly `cluster_key`, `finding_type`, `session_id`,
   `paraphrase`, `occurrence_count`, `confidence`, and `evidence` fields. Each
   evidence item has exactly `digest_path`, `project`, `source_line`,
-  `timestamp`, and `kind` fields. `project` must be copied from the digest
-  manifest metadata for that path; never infer it from a digest filename.
-  Repeated evidence references with the same path and line are counted once.
+  `timestamp`, `kind`, and `occurrence_count` fields. `project` must be copied
+  from the digest manifest metadata for that path; never infer it from a
+  digest filename. `finding.occurrence_count` must equal the sum of distinct
+  evidence `occurrence_count` values. Repeated evidence references with the
+  same path and line are counted once.
 - `paraphrase` is non-empty, one line, and paraphrases the signal without
   copying sensitive transcript text.
 - `occurrence_count` is a positive integer. `confidence` is a number from
   `0.0` through `1.0`, inclusive.
 - Each evidence reference names an assigned digest path, uses a positive
   digest `source_line`, and includes an RFC 3339 timestamp with timezone.
-  Evidence is typed and must point to the signal supporting that finding.
+  Evidence is typed, has a positive `occurrence_count`, and must point to the
+  signal supporting that finding.
 - `themes` is an array of zero, one, or two short strings. Do not include more
   than two themes.
 - Use `findings: []` when the batch has no retained signals. Do not fabricate

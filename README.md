@@ -79,12 +79,17 @@ Claude Code and Codex use the same sequence but their hosts choose their own
 available delegation mechanism:
 
 1. Delegate one bounded miner worker per digest batch and collect JSON reports.
-2. Resume `reflect_setup.py` with those reports and inspect the ranked report.
-3. Ask for explicit consent per cluster. The host constructs an
-   `ApplyRequest` and `WorkspaceState`, then calls `run_reflection(...,
-   apply=True, approved_clusters=..., apply_requests=...,
-   apply_workspaces=...)` to obtain bounded previews.
-4. Execute only after preview consent, collect a `FixProof`, and call the API
+2. Collect typed `CoverageObservation` values (or validated coverage records)
+   from host trigger/invocation and independent outcome evidence; do not infer
+   eligibility from declared files.
+3. Resume `reflect_setup.py` with those reports and observations, then inspect
+   the ranked report.
+4. Ask for explicit consent per cluster. The host constructs an
+   `ApplyRequest`, `WorkspaceState`, and any host `CoverageObservation` values,
+   then calls `run_reflection(..., apply=True, approved_clusters=...,
+   apply_requests=..., apply_workspaces=...,
+   coverage_observations=...)` to obtain bounded previews.
+5. Execute only after preview consent, collect a `FixProof`, and call the API
    with `apply_proofs=...`. The host then updates notes/ledger using its own
    workflow.
 

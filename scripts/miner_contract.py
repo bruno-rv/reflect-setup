@@ -30,7 +30,10 @@ _FINDING_FIELDS = frozenset(
         "evidence",
     }
 )
-_EVIDENCE_FIELDS = frozenset({"digest_path", "source_line", "timestamp", "kind", "project"})
+_EVIDENCE_FIELDS = frozenset(
+    {"digest_path", "source_line", "timestamp", "kind", "project", "occurrence_count"}
+)
+_EVIDENCE_REQUIRED_FIELDS = _EVIDENCE_FIELDS - {"occurrence_count"}
 _RFC3339_DATETIME = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
 )
@@ -57,6 +60,7 @@ class EvidenceRef:
     timestamp: datetime
     kind: FindingType
     project: str
+    occurrence_count: int = 1
 
 
 @_frozen_dataclass
@@ -204,7 +208,12 @@ def _parse_evidence(
     index: int,
 ) -> EvidenceRef:
     value = _strict_object(raw, f"findings[].evidence[{index}]")
-    _exact_fields(value, _EVIDENCE_FIELDS, f"findings[].evidence[{index}]")
+    _exact_fields(value, _EVIDENCE_REQUIRED_FIELDS, f"findings[].evidence[{index}]")
+    extra = sorted(set(value) - _EVIDENCE_FIELDS)
+    if extra:
+        _fail(
+            f"findings[].evidence[{index}] has unexpected fields: {', '.join(extra)}"
+        )
     digest_path = _non_empty_string(value["digest_path"], "evidence.digest_path")
     if digest_path not in manifest_paths:
         _fail(f"evidence digest path is missing from manifest: {digest_path}")
@@ -228,12 +237,20 @@ def _parse_evidence(
         _fail(f"unsupported evidence kind: {evidence_kind}")
     if kind is not finding_type:
         _fail("evidence.kind must match finding_type")
+    occurrence_count = value.get("occurrence_count", 1)
+    if (
+        isinstance(occurrence_count, bool)
+        or not isinstance(occurrence_count, int)
+        or occurrence_count <= 0
+    ):
+        _fail("evidence.occurrence_count must be a positive integer")
     return EvidenceRef(
         digest_path=digest_path,
         source_line=source_line,
         timestamp=_timestamp(value["timestamp"], "evidence.timestamp"),
         kind=kind,
         project=project,
+        occurrence_count=occurrence_count,
     )
 
 
@@ -273,6 +290,7 @@ def _parse_finding(
         _fail("finding.evidence must contain at least one reference")
     evidence = []
     seen = set()
+    seen_counts: dict[tuple[str, int], int] = {}
     for evidence_index, raw_ref in enumerate(raw_evidence):
         ref = _parse_evidence(
             raw_ref,
@@ -285,7 +303,15 @@ def _parse_finding(
         key = _evidence_key(ref)
         if key not in seen:
             seen.add(key)
+            seen_counts[key] = ref.occurrence_count
             evidence.append(ref)
+        elif seen_counts[key] != ref.occurrence_count:
+            _fail("duplicate evidence references must use the same occurrence_count")
+    evidence_count = sum(ref.occurrence_count for ref in evidence)
+    if occurrence_count != evidence_count:
+        _fail(
+            "finding.occurrence_count must equal the sum of distinct evidence occurrence_count values"
+        )
     return Finding(
         cluster_key=cluster_key,
         finding_type=finding_type,
@@ -379,6 +405,7 @@ def _validate_typed_finding(
     if not isinstance(finding.evidence, (tuple, list)) or not finding.evidence:
         _fail(f"{label}.evidence must contain at least one reference")
     seen = set()
+    seen_counts: dict[tuple[str, int], int] = {}
     for evidence_index, ref in enumerate(finding.evidence):
         evidence_label = f"{label}.evidence[{evidence_index}]"
         if not isinstance(ref, EvidenceRef):
@@ -398,10 +425,30 @@ def _validate_typed_finding(
             _fail(f"{evidence_label}.timestamp must include a timezone")
         if not isinstance(ref.kind, FindingType) or ref.kind is not finding.finding_type:
             _fail(f"{evidence_label}.kind must match finding_type")
+        if (
+            isinstance(ref.occurrence_count, bool)
+            or not isinstance(ref.occurrence_count, int)
+            or ref.occurrence_count <= 0
+        ):
+            _fail(f"{evidence_label}.occurrence_count must be a positive integer")
         key = _evidence_key(ref)
         if key in seen:
+            if seen_counts[key] != ref.occurrence_count:
+                _fail(f"{evidence_label} duplicates evidence with a different occurrence_count")
             continue
         seen.add(key)
+        seen_counts[key] = ref.occurrence_count
+    evidence_count = sum(
+        ref.occurrence_count
+        for index, ref in enumerate(finding.evidence)
+        if _evidence_key(ref) not in {
+            _evidence_key(previous) for previous in finding.evidence[:index]
+        }
+    )
+    if finding.occurrence_count != evidence_count:
+        _fail(
+            f"{label}.occurrence_count must equal the sum of distinct evidence occurrence_count values"
+        )
 
 
 def _typed_report_paths(report: MinerReport, manifest: DigestManifest) -> tuple[str, ...]:
@@ -494,10 +541,16 @@ def merge_reports(reports: tuple[MinerReport, ...] | list[MinerReport], manifest
             ),
         )
         for finding in ordered_findings:
-            finding_keys = {_evidence_key(ref) for ref in finding.evidence}
-            if finding_keys - seen_observation_evidence:
-                merged_count += finding.occurrence_count
-                seen_observation_evidence.update(finding_keys)
+            for ref in finding.evidence:
+                key = _evidence_key(ref)
+                existing = all_evidence.get(key)
+                if existing is not None and existing.occurrence_count != ref.occurrence_count:
+                    _fail(
+                        "duplicate evidence references must use the same occurrence_count"
+                    )
+                if key not in seen_observation_evidence:
+                    merged_count += ref.occurrence_count
+                    seen_observation_evidence.add(key)
             for ref in finding.evidence:
                 key = _evidence_key(ref)
                 existing = all_evidence.get(key)

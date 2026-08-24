@@ -1,4 +1,6 @@
 reflection-notes.md
 clusters.yaml
+.reflect-setup-run/
+.reflect-setup-run-*/
 __pycache__/
 .remember/

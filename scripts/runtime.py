@@ -163,7 +163,8 @@ def _project_filter_matches(project: str, scope: Scope) -> bool:
 
 
 def _skip_subagent_path(relative_path: str, scope: Scope) -> bool:
-    return not scope.include_subagents and "subagents" in Path(relative_path).parts
+    parts = Path(relative_path).parts
+    return "memory" in parts or (not scope.include_subagents and "subagents" in parts)
 
 
 def _read_codex_metadata(path: Path) -> dict | None:
@@ -350,6 +351,49 @@ def _existing_manifest(target: Path) -> dict[str, object] | None:
     return value if isinstance(value, dict) else None
 
 
+def _verify_installed_copy(
+    target: Path,
+    snapshot: _SourceSnapshot,
+    installed: Mapping[str, object],
+) -> None:
+    """Rehash every managed file before accepting copy-install idempotence."""
+    expected = {file.relative: file.sha256 for file in snapshot}
+    manifest_files = installed.get("files")
+    if not isinstance(manifest_files, dict) or manifest_files != expected:
+        raise _collision(target, "managed copy manifest file hashes do not match source")
+
+    manifest_path = target / ".reflect-setup-source.json"
+    actual: dict[str, str] = {}
+    for path in target.rglob("*"):
+        if path == manifest_path:
+            continue
+        relative = path.relative_to(target).as_posix()
+        if path.is_file() or path.is_symlink():
+            if path.is_symlink() and not path.is_file():
+                actual[relative] = "<directory symlink>"
+            else:
+                try:
+                    actual[relative] = _stream_file_hash(path)[0]
+                except OSError as exc:
+                    raise _collision(target, f"cannot hash managed file {relative}") from exc
+    missing = sorted(set(expected) - set(actual))
+    extra = sorted(set(actual) - set(expected))
+    mismatched = sorted(
+        relative
+        for relative in set(expected).intersection(actual)
+        if actual[relative] != expected[relative]
+    )
+    if missing or extra or mismatched:
+        details = []
+        if missing:
+            details.append("missing=" + ",".join(missing))
+        if extra:
+            details.append("extra=" + ",".join(extra))
+        if mismatched:
+            details.append("tampered=" + ",".join(mismatched))
+        raise _collision(target, "managed copy files changed (" + "; ".join(details) + ")")
+
+
 def _collision(target: Path, detail: str) -> FileExistsError:
     return FileExistsError(f"cannot install skill at {target}: {detail}")
 
@@ -399,6 +443,7 @@ def install_skill(
                 raise _collision(target, "existing file")
             installed = _existing_manifest(target)
             if installed is not None and installed.get("source_hash") == source_hash:
+                _verify_installed_copy(target, files, installed)
                 return InstallResult(spec.runtime, mode, target, source_hash)
             if installed is not None:
                 raise _collision(target, "manifest hash mismatch")

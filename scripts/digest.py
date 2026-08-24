@@ -2,19 +2,18 @@
 """Runtime-aware, deterministic pre-extraction digest for reflect-setup.
 
 The typed path in this module scans every candidate JSONL source and filters
-events by their timestamps. The older ``signals_from_line`` and ``run``
-functions remain available for the original Claude-only command and tests.
+events by their timestamps. Use ``scripts/reflect_setup.py`` as the public
+entry point; ``signals_from_line`` remains only as an import-compatibility
+wrapper.
 """
 from __future__ import annotations
 
-import argparse
 import hashlib
 import json
 import os
 import re
 import sys
 import tempfile
-import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -352,6 +351,8 @@ def _candidate_paths(spec: RuntimeSpec, scope: Scope):
         if not path.is_file():
             continue
         relative = path.relative_to(spec.source_root).as_posix()
+        if "memory" in Path(relative).parts:
+            continue
         if not scope.include_subagents and "subagents" in Path(relative).parts:
             continue
         if spec.runtime is Runtime.CLAUDE:
@@ -655,107 +656,33 @@ def run_digest(spec: RuntimeSpec, scope: Scope, out_dir: Path) -> DigestManifest
     return manifest
 
 
-# Original Claude-only compatibility command.
+class LegacyDigestWorkflowError(RuntimeError):
+    """Raised when callers attempt the retired mtime-based digest workflow."""
 
 
-def iter_session_files(projects_dir, since_days, project_filter):
-    """Yield legacy ``(project, path)`` files filtered by filesystem mtime."""
-    cutoff = time.time() - since_days * 86400
-    try:
-        project_names = sorted(os.listdir(projects_dir))
-    except OSError as exc:
-        print(f"digest: cannot read {projects_dir}: {exc}", file=sys.stderr)
-        return
-    for project in project_names:
-        if project_filter and project_filter not in project:
-            continue
-        project_path = os.path.join(projects_dir, project)
-        if not os.path.isdir(project_path):
-            continue
-        for root, dirs, files in os.walk(project_path):
-            dirs[:] = [d for d in dirs if d != "memory"]
-            for name in files:
-                if not name.endswith(".jsonl"):
-                    continue
-                path = os.path.join(root, name)
-                try:
-                    mtime = os.path.getmtime(path)
-                except OSError:
-                    continue
-                if mtime < cutoff:
-                    continue
-                yield project, path
-
-
-def digest_session(path):
-    """Return legacy tuples from one Claude session file."""
-    signals = []
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as stream:
-            for line in stream:
-                line = line.strip()
-                if not line:
-                    continue
-                signals.extend(signals_from_line(line))
-    except OSError as exc:
-        print(f"digest: skipping unreadable {path}: {exc}", file=sys.stderr)
-    return signals
-
-
-def write_digest(out_dir, project, session_basename, signals):
-    os.makedirs(out_dir, exist_ok=True)
-    fname = f"{project}__{session_basename}.md"
-    fpath = os.path.join(out_dir, fname)
-    with open(fpath, "w", encoding="utf-8") as stream:
-        stream.write(f"# {session_basename} ({project})\n")
-        stream.write(f"# project: {project}\n\n")
-        for kind, timestamp, text in signals:
-            stream.write(f"- {timestamp} [{kind}] {text}\n")
-    return fpath
-
-
-def run(projects_dir, since_days, out_dir, project_filter):
-    sessions_scanned = 0
-    sessions_written = 0
-    counts = {"user": 0, "error": 0, "interrupt": 0}
-    projects_seen = set()
-
-    for project, path in iter_session_files(projects_dir, since_days, project_filter):
-        sessions_scanned += 1
-        projects_seen.add(project)
-        signals = digest_session(path)
-        if not signals:
-            continue
-        for kind, unused_timestamp, unused_text in signals:
-            counts[kind] = counts.get(kind, 0) + 1
-        session_basename = os.path.basename(path)
-        if session_basename.endswith(".jsonl"):
-            session_basename = session_basename[: -len(".jsonl")]
-        write_digest(out_dir, project, session_basename, signals)
-        sessions_written += 1
-
-    return sessions_scanned, sessions_written, len(projects_seen), counts
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--projects-dir", required=True, help="e.g. ~/.claude/projects")
-    parser.add_argument("--since", type=int, default=30, help="days back (default 30)")
-    parser.add_argument("--out", required=True, help="directory to write digests into")
-    parser.add_argument("--project-filter", default=None, help="substring match on project dir name")
-    args = parser.parse_args()
-
-    projects_dir = os.path.expanduser(args.projects_dir)
-    out_dir = os.path.expanduser(args.out)
-    scanned, written, n_projects, counts = run(projects_dir, args.since, out_dir, args.project_filter)
-
-    print(f"digest: scanned {scanned} session file(s) across {n_projects} project(s) (since {args.since}d)")
-    print(f"digest: {written} session(s) had signals -> {out_dir}")
-    print(
-        "digest: signals extracted -> "
-        f"user={counts['user']} error={counts['error']} interrupt={counts['interrupt']}"
+def _legacy_workflow_unavailable(*unused_args, **unused_kwargs):
+    raise LegacyDigestWorkflowError(
+        "the legacy digest workflow is unavailable; use scripts/reflect_setup.py "
+        "to create a typed event-time manifest"
     )
 
 
+# Keep import names available for downstream callers, but fail closed rather
+# than allowing a legacy path to bypass manifest completeness checks.
+iter_session_files = _legacy_workflow_unavailable
+digest_session = _legacy_workflow_unavailable
+write_digest = _legacy_workflow_unavailable
+run = _legacy_workflow_unavailable
+
+
+def main():
+    print(
+        "digest.py direct execution is unavailable; use scripts/reflect_setup.py "
+        "for the typed event-time manifest workflow",
+        file=sys.stderr,
+    )
+    return 2
+
+
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

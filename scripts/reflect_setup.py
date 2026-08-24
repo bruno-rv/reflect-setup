@@ -25,25 +25,27 @@ from apply import (
     check_scope_overlap,
     validate_proof,
 )
-from coverage_model import CoverageRecord, Inventory, InventoryItem, assess_coverage
+from coverage_model import (
+    CoverageObservation,
+    CoverageRecord,
+    Inventory,
+    InventoryItem,
+    assess_coverage,
+)
 from digest import DigestManifest, IncompleteDigestError, run_digest
 from ledger import LedgerStatus, parse_ledger
 from miner_contract import (
     BatchSpec,
+    EvidenceRef,
     Finding,
     MinerReport,
     ReportValidationError,
     parse_report,
     merge_reports,
 )
-from runtime import RuntimeSpec, Scope, resolve_runtime
+from runtime import RuntimeSpec, Scope, discover_sessions, resolve_runtime
 from scoring import CandidateScore, compute_metrics, rank_candidates, score_candidate
-from verification import (
-    FixVerification,
-    VerificationEvidence,
-    VerificationLabel,
-    verify_fix,
-)
+from verification import FixVerification, verify_fix
 
 
 UTC = timezone.utc
@@ -153,6 +155,26 @@ def _validate_continuation_manifest(
         raise ReportValidationError("continuation manifest lacks scope hash")
     if scope_hash != _scope_hash(manifest.scope):
         raise ReportValidationError("continuation manifest scope hash changed")
+    expected_sessions = {
+        source.source_path
+        for source in manifest.source_files
+        if source.scanned
+    }
+    current_sessions = {
+        session.relative_path
+        for session in discover_sessions(spec, manifest.scope)
+    }
+    if current_sessions != expected_sessions:
+        added = sorted(current_sessions - expected_sessions)
+        removed = sorted(expected_sessions - current_sessions)
+        details = []
+        if added:
+            details.append("added=" + ",".join(added))
+        if removed:
+            details.append("removed=" + ",".join(removed))
+        raise ReportValidationError(
+            "continuation session set changed: " + "; ".join(details)
+        )
     for source in manifest.source_files:
         if not isinstance(source.source_path, str) or not source.source_path:
             raise ReportValidationError("continuation manifest source_path must be a non-empty string")
@@ -331,20 +353,126 @@ def _inventory(spec: RuntimeSpec) -> Inventory:
     return Inventory(tuple(items))
 
 
-def _coverage(inventory: Inventory) -> tuple[CoverageRecord, ...]:
-    records = []
-    for item in inventory.items:
-        records.append(
-            assess_coverage(
-                artifact_id=item.artifact_id,
-                artifact_kind=item.artifact_kind,
-                exists=item.declared,
-                eligible=False,
-                trigger_evidence=(),
-                prevention_evidence=(),
-                symptom_recurred=False,
-            )
+def _coverage(
+    inventory: Inventory,
+    observations: Iterable[CoverageObservation] | Mapping[str, CoverageObservation] | None,
+    supplied_records: Iterable[CoverageRecord]
+    | Mapping[str, CoverageRecord]
+    | None = None,
+) -> tuple[CoverageRecord, ...]:
+    """Derive coverage only from typed host observations.
+
+    Inventory declaration is local state; eligibility and operating evidence
+    belong to the host that can observe its trigger and outcome behavior.
+    Missing observations therefore produce no coverage record rather than a
+    guessed ineligible record.
+    """
+    if observations is not None and supplied_records is not None:
+        raise ReportValidationError(
+            "provide coverage_observations or coverage_records, not both"
         )
+    if observations is None and supplied_records is None:
+        return ()
+    if supplied_records is not None:
+        if isinstance(supplied_records, Mapping):
+            raw_records = []
+            for supplied_id, record in supplied_records.items():
+                if not isinstance(supplied_id, str) or not supplied_id.strip():
+                    raise ReportValidationError("coverage record mapping keys must be non-empty strings")
+                if not isinstance(record, CoverageRecord):
+                    raise ReportValidationError(
+                        "coverage_records must contain CoverageRecord values"
+                    )
+                if supplied_id != record.artifact_id:
+                    raise ReportValidationError(
+                        "coverage record mapping key does not match artifact_id"
+                    )
+                raw_records.append(record)
+            records = tuple(raw_records)
+        else:
+            records = tuple(supplied_records)
+        inventory_by_key = {
+            (item.artifact_id, item.artifact_kind): item for item in inventory.items
+        }
+        seen: set[tuple[str, str]] = set()
+        validated: list[CoverageRecord] = []
+        for record in records:
+            if not isinstance(record, CoverageRecord):
+                raise ReportValidationError("coverage_records must contain CoverageRecord values")
+            key = (record.artifact_id, record.artifact_kind)
+            item = inventory_by_key.get(key)
+            if item is None:
+                raise ReportValidationError(
+                    "coverage record references unknown artifact id/type: "
+                    f"{record.artifact_id} ({record.artifact_kind})"
+                )
+            if record.declared != item.declared:
+                raise ReportValidationError(
+                    f"coverage record declaration does not match inventory for {record.artifact_id}"
+                )
+            if key in seen:
+                raise ReportValidationError(
+                    f"duplicate coverage record for {record.artifact_id} ({record.artifact_kind})"
+                )
+            if not isinstance(record.eligible, bool) or not isinstance(record.triggered, bool):
+                raise ReportValidationError("coverage record states must be booleans")
+            if record.prevented is not None and not isinstance(record.prevented, bool):
+                raise ReportValidationError("coverage record prevented must be boolean or null")
+            evidence = tuple(record.evidence) + tuple(record.trigger_evidence) + tuple(record.prevention_evidence)
+            if any(not isinstance(ref, EvidenceRef) for ref in evidence):
+                raise ReportValidationError("coverage record evidence must contain EvidenceRef values")
+            seen.add(key)
+            validated.append(record)
+        return tuple(validated)
+    if isinstance(observations, Mapping):
+        raw_values = []
+        for supplied_id, observation in observations.items():
+            if not isinstance(supplied_id, str) or not supplied_id.strip():
+                raise ReportValidationError("coverage observation mapping keys must be non-empty strings")
+            if not isinstance(observation, CoverageObservation):
+                raise ReportValidationError(
+                    "coverage_observations must contain CoverageObservation values"
+                )
+            if supplied_id != observation.artifact_id:
+                raise ReportValidationError(
+                    "coverage observation mapping key does not match artifact_id"
+                )
+            raw_values.append(observation)
+        raw_values = tuple(raw_values)
+    else:
+        raw_values = tuple(observations)
+    inventory_by_key: dict[tuple[str, str], InventoryItem] = {}
+    for item in inventory.items:
+        if not isinstance(item, InventoryItem):
+            raise ReportValidationError("inventory items must be InventoryItem values")
+        key = (item.artifact_id, item.artifact_kind)
+        if key in inventory_by_key:
+            raise ReportValidationError(
+                "inventory contains duplicate artifact id/type: "
+                f"{item.artifact_id} ({item.artifact_kind})"
+            )
+        inventory_by_key[key] = item
+    seen: set[tuple[str, str]] = set()
+    records: list[CoverageRecord] = []
+    for observation in raw_values:
+        if not isinstance(observation, CoverageObservation):
+            raise ReportValidationError(
+                "coverage_observations must contain CoverageObservation values"
+            )
+        key = (observation.artifact_id, observation.artifact_kind)
+        item = inventory_by_key.get(key)
+        if item is None:
+            raise ReportValidationError(
+                "coverage observation references unknown artifact id/type: "
+                f"{observation.artifact_id} ({observation.artifact_kind})"
+            )
+        if key in seen:
+            raise ReportValidationError(
+                "duplicate coverage observation for "
+                f"{observation.artifact_id} ({observation.artifact_kind})"
+            )
+        seen.add(key)
+        records.append(assess_coverage(observation=observation, exists=item.declared))
     return tuple(records)
 
 
@@ -496,7 +624,13 @@ def _proof_map(values: Any) -> dict[str, FixProof]:
             raise ApplyApprovalError(
                 f"ambiguous FixProof IDs normalize to {canonical!r}"
             )
-        result[canonical] = proof
+        result[canonical] = FixProof(
+            canonical,
+            proof.changed_paths,
+            proof.command_output,
+            proof.verification_output,
+            proof.passed,
+        )
     return result
 
 
@@ -540,19 +674,15 @@ def _verify_ledger(
             LedgerStatus.RESOLVED,
         }:
             continue
-        symptom = tuple(
-            VerificationEvidence(ref, VerificationLabel.SYMPTOM_RECURRED)
-            for finding in normalized_clusters.get(_cluster_id(entry.cluster_id), ())
-            for ref in finding.evidence
-        )
         results.append(
             verify_fix(
                 entry,
-                symptom_evidence=symptom,
+                symptom_evidence=(),
                 invocation_evidence=(),
                 outcome_evidence=(),
-                merged_findings=(),
+                merged_findings=normalized_clusters.get(_cluster_id(entry.cluster_id), ()),
                 coverage_records=coverage,
+                target_artifact_ids=(entry.wired_check,),
             )
         )
     return tuple(results)
@@ -659,6 +789,12 @@ def run_reflection(
     apply_requests: Iterable[ApplyRequest] | Mapping[str, ApplyRequest] | None = None,
     apply_workspaces: Mapping[str, WorkspaceState] | None = None,
     apply_proofs: Iterable[FixProof] | Mapping[str, FixProof] | None = None,
+    coverage_observations: Iterable[CoverageObservation]
+    | Mapping[str, CoverageObservation]
+    | None = None,
+    coverage_records: Iterable[CoverageRecord]
+    | Mapping[str, CoverageRecord]
+    | None = None,
     ledger_path: Path | None = None,
 ) -> ReflectionRun:
     """Run one complete reflection pass and write an atomic JSON report.
@@ -720,7 +856,7 @@ def run_reflection(
     reports = _load_reports(tuple(Path(path) for path in miner_report_paths), manifest)
     findings = merge_reports(reports, manifest) if reports else ()
     inventory = _inventory(spec)
-    coverage = _coverage(inventory)
+    coverage = _coverage(inventory, coverage_observations, coverage_records)
     verification = _verify_ledger(findings, coverage, ledger_path)
     regression_counts = {
         _cluster_id(item.cluster_id): 1

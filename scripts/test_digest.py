@@ -12,7 +12,13 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import digest
-from digest import IncompleteDigestError, SignalKind, run_digest, signals_from_event
+from digest import (
+    IncompleteDigestError,
+    LegacyDigestWorkflowError,
+    SignalKind,
+    run_digest,
+    signals_from_event,
+)
 from runtime import Scope, resolve_runtime
 
 
@@ -499,12 +505,12 @@ def test_end_to_end_writes_digest_and_skips_empty_and_memory():
         os.makedirs(proj_a)
         with_signal = os.path.join(proj_a, "session-with-signal.jsonl")
         with open(with_signal, "w") as fh:
-            fh.write(make_line({"type": "user", "timestamp": "t1", "message": {"role": "user", "content": "hello"}}))
+            fh.write(make_line({"type": "user", "timestamp": "2026-08-23T10:00:00Z", "message": {"role": "user", "content": "hello"}}))
             fh.write(
                 make_line(
                     {
                         "type": "assistant",
-                        "timestamp": "t2",
+                        "timestamp": "2026-08-23T10:01:00Z",
                         "message": {"role": "assistant", "content": [{"type": "text", "text": "hi there"}]},
                     }
                 )
@@ -516,7 +522,7 @@ def test_end_to_end_writes_digest_and_skips_empty_and_memory():
                 make_line(
                     {
                         "type": "assistant",
-                        "timestamp": "t3",
+                        "timestamp": "2026-08-23T10:02:00Z",
                         "message": {"role": "assistant", "content": [{"type": "text", "text": "just thinking"}]},
                     }
                 )
@@ -526,20 +532,42 @@ def test_end_to_end_writes_digest_and_skips_empty_and_memory():
         memory_dir = os.path.join(proj_a, "memory")
         os.makedirs(memory_dir)
         with open(os.path.join(memory_dir, "session-in-memory.jsonl"), "w") as fh:
-            fh.write(make_line({"type": "user", "timestamp": "t4", "message": {"role": "user", "content": "secret"}}))
+            fh.write(make_line({"type": "user", "timestamp": "2026-08-23T10:03:00Z", "message": {"role": "user", "content": "secret"}}))
 
-        scanned, written, n_projects, counts = digest.run(projects_dir, since_days=3650, out_dir=out_dir, project_filter=None)
+        spec = resolve_runtime("claude", home=Path(tmp), env={}, source_root=Path(projects_dir))
+        manifest = run_digest(
+            spec,
+            Scope(datetime(2026, 8, 23, tzinfo=timezone.utc), None, False),
+            Path(out_dir),
+        )
 
-        assert scanned == 2, scanned  # memory session never yielded
-        assert written == 1, written
-        assert n_projects == 1, n_projects
-        assert counts["user"] == 1, counts
-
+        assert manifest.sessions_scanned == 2, manifest
+        assert manifest.sessions_with_signals == 1
+        assert manifest.signal_counts["user"] == 1
         digest_files = os.listdir(out_dir)
-        assert len(digest_files) == 1, digest_files
-        assert digest_files[0] == "proj-a__session-with-signal.md", digest_files
+        assert len([name for name in digest_files if name.endswith(".md")]) == 1, digest_files
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_legacy_digest_cli_fails_closed_and_points_to_typed_entrypoint():
+    completed = __import__("subprocess").run(
+        [os.sys.executable, "scripts/digest.py", "--projects-dir", "/tmp", "--out", "/tmp/reflect-setup-test"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode != 0
+    assert "reflect_setup.py" in completed.stderr
+
+
+def test_legacy_digest_writer_is_unavailable():
+    try:
+        digest.run("/tmp", 30, "/tmp/reflect-setup-test", None)
+    except LegacyDigestWorkflowError as exc:
+        assert "typed" in str(exc)
+    else:
+        raise AssertionError("legacy digest workflow must not remain callable")
 
 
 def main():

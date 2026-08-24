@@ -2,7 +2,6 @@
 name: reflect-setup
 description: Diagnostic-only, dual-runtime scan of Claude Code or Codex session transcripts to find recurring friction and rank improvement candidates with cited evidence.
 argument-hint: [days-back] [project-filter]
-allowed-tools: Read, Grep, Glob, Bash, Task, Write, AskUserQuestion
 ---
 
 # Reflect on Setup
@@ -25,7 +24,10 @@ exist. The detailed operator contract is in `REFERENCE.md`.
 2. **Inventory** — record declared skills, commands, agents, hooks, and
    configuration for the selected host; declaration is not operation.
    [Detail](REFERENCE.md#inventory)
-3. **Digest** — run `scripts/reflect_setup.py`/`scripts/digest.py` into a new
+   The host must separately collect typed `CoverageObservation` values for any
+   artifact whose eligibility, invocation, or prevention behavior it can prove;
+   the core never invents eligibility from inventory presence.
+3. **Digest** — run `scripts/reflect_setup.py` into a new
    scratch directory. The manifest records every candidate source and fails
    closed on malformed or unreadable input. [Detail](REFERENCE.md#digest)
 4. **Mine** — partition non-empty digest paths into disjoint batches and dispatch

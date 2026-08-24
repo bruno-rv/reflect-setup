@@ -40,7 +40,30 @@ Each `CoverageRecord` keeps these states independent:
   `false` means recurrence and `null` means insufficient outcome evidence.
 
 An existing `SKILL.md`, command, hook, or config file is never treated as proof
-that the artifact operated.
+that the artifact operated. The host must collect explicit typed
+`CoverageObservation` values when it can observe eligibility, invocation, and
+independent prevention evidence:
+
+```python
+run_reflection(
+    ...,
+    coverage_observations=(
+        CoverageObservation(
+            artifact_id="fixture/SKILL.md",
+            artifact_kind="skills",
+            eligible=True,
+            trigger_evidence=invocation_refs,
+            prevention_evidence=outcome_refs,
+            symptom_recurred=False,
+        ),
+    ),
+)
+```
+
+Missing observations produce no coverage record. Hosts may pass already
+validated `CoverageRecord` values through `coverage_records` instead; the two
+forms are mutually exclusive. The core validates each artifact ID/type
+against the inventory and never invents `eligible=False`.
 
 ## Digest and manifest
 
@@ -56,6 +79,11 @@ malformed or unreadable source produces `complete: false`, persists the
 manifest, and exits nonzero with `IncompleteDigestError`; miners are not
 dispatched. A non-empty output directory without a persisted manifest is
 rejected rather than reused.
+
+`scripts/digest.py` is an internal typed implementation module. Running it
+directly, or calling its retired writer helpers, fails closed; use the typed
+`scripts/reflect_setup.py` entry point so event-time filtering and manifest
+completeness checks cannot be bypassed.
 
 When the first phase stops because reports are not yet available, host miners
 may run over the persisted digest files. A later invocation with the same run
@@ -84,7 +112,9 @@ Each finding has `cluster_key`, `finding_type` (`correction`, `friction`,
 `failure`, or `complaint`), `session_id`, one-line `paraphrase`, positive
 `occurrence_count`, confidence in `[0,1]`, and typed evidence. Each evidence
 reference includes `digest_path`, positive `source_line`, RFC3339 `timestamp`,
-matching `kind`, and explicit `project` identity.
+matching `kind`, explicit `project` identity, and a positive
+`occurrence_count`. The finding count must equal the sum of distinct evidence
+counts; overlapping reports count each evidence key once.
 
 The report's ordered `digest_paths` must equal its assigned `BatchSpec`. Across
 all reports, each non-empty manifest digest path must occur in exactly one
@@ -165,6 +195,7 @@ run_reflection(
     approved_clusters=("stable-cluster-id",),
     apply_requests=(apply_request,),
     apply_workspaces={"stable-cluster-id": workspace_state},
+    coverage_observations=coverage_observations,
 )
 ```
 

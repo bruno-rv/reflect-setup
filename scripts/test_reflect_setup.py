@@ -8,7 +8,8 @@ from tempfile import TemporaryDirectory
 
 from digest import IncompleteDigestError
 from apply import ApplyRequest, FixProof, WorkspaceState
-from miner_contract import ReportValidationError
+from coverage_model import CoverageObservation, assess_coverage
+from miner_contract import EvidenceRef, FindingType, ReportValidationError
 from reflect_setup import ApplyApprovalError, run_reflection
 
 
@@ -419,6 +420,122 @@ def test_ledger_is_only_read_when_explicitly_supplied():
             **{key: value for key, value in kwargs.items() if key != "apply"},
         )
         assert len(json.loads(explicit.report_path.read_text())["verification"]) == 1
+
+
+def test_orchestration_requires_typed_host_coverage_for_operating_states():
+    with TemporaryDirectory() as raw:
+        root = Path(raw)
+        kwargs, report, manifest = _prepare_ranked_continuation(root)
+        skill = root / ".claude" / "skills" / "fixture" / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text("fixture\n")
+        ledger = root / "clusters.yaml"
+        ledger.write_text(
+            "- id: repeat-fix\n"
+            "  status: fix-applied\n"
+            "  wired_check: fixture/SKILL.md\n"
+        )
+        digest_path = manifest["source_files"][0]["digest_path"]
+        coverage = CoverageObservation(
+            artifact_id="fixture/SKILL.md",
+            artifact_kind="skills",
+            eligible=True,
+            trigger_evidence=(
+                EvidenceRef(
+                    digest_path, 1,
+                    datetime(2026, 8, 23, tzinfo=timezone.utc),
+                    FindingType.FAILURE, "project-a",
+                ),
+            ),
+            prevention_evidence=(
+                EvidenceRef(
+                    digest_path, 2,
+                    datetime(2026, 8, 23, tzinfo=timezone.utc),
+                    FindingType.FAILURE, "project-a",
+                ),
+            ),
+            symptom_recurred=False,
+        )
+        result = run_reflection(
+            miner_report_paths=(report,),
+            ledger_path=ledger,
+            coverage_observations=(coverage,),
+            apply=False,
+            **{key: value for key, value in kwargs.items() if key != "apply"},
+        )
+        payload = json.loads(result.report_path.read_text())
+        assert payload["coverage"][0]["eligible"] is True
+        assert payload["verification"][0]["invocation"]["status"] == "pass"
+        assert payload["verification"][0]["outcome"]["status"] == "pass"
+        record_result = run_reflection(
+            miner_report_paths=(report,),
+            ledger_path=ledger,
+            coverage_records=(assess_coverage(observation=coverage, exists=True),),
+            apply=False,
+            **{key: value for key, value in kwargs.items() if key != "apply"},
+        )
+        assert json.loads(record_result.report_path.read_text())["coverage"][0]["eligible"] is True
+
+
+def test_orchestration_rejects_unknown_host_coverage_artifact():
+    with TemporaryDirectory() as raw:
+        root = Path(raw)
+        kwargs, report, _ = _prepare_ranked_continuation(root)
+        unknown = CoverageObservation("not-in-inventory", "skill", True, (), (), False)
+        try:
+            run_reflection(
+                miner_report_paths=(report,),
+                coverage_observations=(unknown,),
+                apply=False,
+                **{key: value for key, value in kwargs.items() if key != "apply"},
+            )
+        except ReportValidationError as exc:
+            assert "artifact" in str(exc)
+        else:
+            raise AssertionError("unknown coverage artifacts must fail closed")
+
+
+def test_continuation_rejects_new_or_removed_in_scope_sessions():
+    for mutation in ("new", "removed"):
+        with TemporaryDirectory() as raw:
+            root = Path(raw)
+            kwargs, report, _ = _prepare_ranked_continuation(root)
+            session = root / "projects" / "project-a" / "session.jsonl"
+            if mutation == "new":
+                (session.parent / "new.jsonl").write_text(session.read_text())
+            else:
+                session.unlink()
+            try:
+                run_reflection(
+                    miner_report_paths=(report,),
+                    apply=False,
+                    **{key: value for key, value in kwargs.items() if key != "apply"},
+                )
+            except ReportValidationError as exc:
+                assert "session set" in str(exc)
+            else:
+                raise AssertionError(f"{mutation} in-scope session must invalidate continuation")
+
+
+def test_noncanonical_fix_proof_id_is_normalized_before_validation():
+    with TemporaryDirectory() as raw:
+        root = Path(raw)
+        kwargs, report, _ = _prepare_ranked_continuation(root)
+        workspace = WorkspaceState(root / "projects" / "project-a", (), False)
+        request = ApplyRequest("repeat fix", (Path("fix.md"),), ("fix command",), ("verify command",))
+        proof = FixProof(
+            "Repeat Fix", (Path("fix.md"),), ("fix command completed",), ("verify command :: PASS",), True
+        )
+        result = run_reflection(
+            miner_report_paths=(report,),
+            approved_clusters=("repeat-fix",),
+            apply_requests=(request,),
+            apply_workspaces={"repeat-fix": workspace},
+            apply_proofs=(proof,),
+            **kwargs,
+        )
+        payload = json.loads(result.report_path.read_text())
+        assert payload["apply"]["validated_proofs"] == ["repeat-fix"]
 
 
 if __name__ == "__main__":

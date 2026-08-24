@@ -192,21 +192,32 @@ def _coverage_contribution(
     for record in records:
         if record.artifact_id not in targets or not record.declared or not record.eligible:
             continue
-        refs = tuple(record.evidence)
-        if any(not isinstance(ref, EvidenceRef) for ref in refs):
+        trigger_refs = tuple(record.trigger_evidence)
+        prevention_refs = tuple(record.prevention_evidence)
+        # Records created before the split fields remain import-compatible;
+        # their combined evidence can prove invocation only.
+        if not trigger_refs and record.evidence:
+            trigger_refs = tuple(record.evidence)
+        if any(
+            not isinstance(ref, EvidenceRef)
+            for ref in trigger_refs + prevention_refs
+        ):
             raise TypeError("coverage record evidence must contain EvidenceRef instances")
         if record.prevented is False:
             symptom_recurred = True
         if record.triggered and not invocation_evidence:
-            invocation.extend(VerificationEvidence(ref, VerificationLabel.INVOKED) for ref in refs)
-            invocation_keys.update(_evidence_key(ref) for ref in refs)
-        if record.triggered and record.prevented is True and invocation_evidence and not outcome_evidence:
-            for ref in refs:
+            invocation.extend(
+                VerificationEvidence(ref, VerificationLabel.INVOKED)
+                for ref in trigger_refs
+            )
+            invocation_keys.update(_evidence_key(ref) for ref in trigger_refs)
+        if record.triggered and record.prevented is True and not outcome_evidence:
+            for ref in prevention_refs:
                 key = _evidence_key(ref)
                 if key not in invocation_keys and key not in outcome_keys:
                     outcome.append(VerificationEvidence(ref, VerificationLabel.OUTCOME_PASS))
-        elif record.triggered and record.prevented is False and invocation_evidence and not outcome_evidence:
-            for ref in refs:
+        elif record.triggered and record.prevented is False and not outcome_evidence:
+            for ref in prevention_refs:
                 key = _evidence_key(ref)
                 if key not in invocation_keys and key not in outcome_keys:
                     outcome.append(VerificationEvidence(ref, VerificationLabel.OUTCOME_FAIL))

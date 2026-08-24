@@ -300,6 +300,12 @@ def test_overlapping_clusters_cannot_run_in_parallel():
     assert check_scope_overlap(first, second) == ("first", "second")
 
 
+def test_directory_scope_overlaps_descendant_scope():
+    first = make_preview(cluster_id="first", target_paths=(Path("hooks"),))
+    second = make_preview(cluster_id="second", target_paths=(Path("hooks/retry.sh"),))
+    assert check_scope_overlap(first, second) == ("first", "second")
+
+
 def run_all():
     tests = [value for name, value in sorted(globals().items()) if name.startswith("test_")]
     for test in tests:

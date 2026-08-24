@@ -101,6 +101,42 @@ def test_copy_install_writes_manifest_and_is_idempotent():
         assert manifest["runtime"] == "codex"
 
 
+def test_copy_install_rejects_tampered_file_even_when_source_hash_is_unchanged():
+    with TemporaryDirectory() as raw:
+        home = Path(raw) / "home"
+        source = Path(raw) / "repo"
+        _source_tree(source)
+        spec = resolve_runtime("claude", home=home, env={})
+        install_skill(spec, source, mode="copy")
+        (spec.skill_root / "SKILL.md").write_text("tampered\n")
+        try:
+            install_skill(spec, source, mode="copy")
+        except FileExistsError as exc:
+            assert "tampered" in str(exc) or "hash" in str(exc)
+        else:
+            raise AssertionError("tampered managed copies must fail closed")
+
+
+def test_copy_install_rejects_missing_and_extra_files_even_when_source_hash_is_unchanged():
+    for mutation in ("missing", "extra"):
+        with TemporaryDirectory() as raw:
+            home = Path(raw) / "home"
+            source = Path(raw) / "repo"
+            _source_tree(source)
+            spec = resolve_runtime("claude", home=home, env={})
+            install_skill(spec, source, mode="copy")
+            if mutation == "missing":
+                (spec.skill_root / "SKILL.md").unlink()
+            else:
+                (spec.skill_root / "extra.md").write_text("extra\n")
+            try:
+                install_skill(spec, source, mode="copy")
+            except FileExistsError as exc:
+                assert mutation in str(exc) or "file" in str(exc)
+            else:
+                raise AssertionError(f"{mutation} managed copies must fail closed")
+
+
 def test_copy_install_records_source_commit_provenance():
     with TemporaryDirectory() as raw:
         home = Path(raw) / "home"
