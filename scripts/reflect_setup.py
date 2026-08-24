@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -15,7 +16,15 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from apply import ApplyPreview
+from apply import (
+    ApplyPreview,
+    ApplyRequest,
+    FixProof,
+    WorkspaceState,
+    build_preview,
+    check_scope_overlap,
+    validate_proof,
+)
 from coverage_model import CoverageRecord, Inventory, InventoryItem, assess_coverage
 from digest import DigestManifest, IncompleteDigestError, run_digest
 from ledger import LedgerStatus, parse_ledger
@@ -60,6 +69,7 @@ class ReflectionRun:
     ranked_candidates: tuple[CandidateScore, ...]
     coverage: tuple[CoverageRecord, ...]
     apply_preview: ApplyPreview | None
+    apply_previews: tuple[ApplyPreview, ...] = ()
 
 
 def _utc(value: datetime) -> datetime:
@@ -78,6 +88,127 @@ def _manifest_digest_paths(manifest: DigestManifest) -> tuple[str, ...]:
     )
 
 
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _scope_hash(scope: Scope) -> str:
+    value = {
+        "since": _utc(scope.since).isoformat(),
+        "project_filter": scope.project_filter,
+        "include_subagents": scope.include_subagents,
+    }
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _continuation_path(raw_path: str, out_dir: Path) -> Path:
+    path = Path(raw_path).expanduser()
+    if path.is_absolute():
+        return path.resolve(strict=False)
+    direct = path.resolve(strict=False)
+    if direct.is_file():
+        return direct
+    return (out_dir / path).resolve(strict=False)
+
+
+def _validate_continuation_manifest(
+    manifest: DigestManifest,
+    spec: RuntimeSpec,
+    out_dir: Path,
+) -> None:
+    """Fail closed if persisted source or digest inputs changed since mining."""
+    if manifest.schema_version != 1:
+        raise ReportValidationError("continuation manifest schema_version must be 1")
+    if not manifest.complete:
+        raise IncompleteDigestError(manifest)
+    source_root = spec.source_root.expanduser().resolve(strict=False)
+    run_root = out_dir.expanduser().resolve(strict=False)
+    manifest_json_path = out_dir / "manifest.json"
+    try:
+        manifest_json = json.loads(manifest_json_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise ReportValidationError("cannot reread continuation manifest") from exc
+    digest_hashes = manifest_json.get("digest_hashes")
+    if digest_hashes is None:
+        raise ReportValidationError("continuation manifest lacks digest hashes")
+    if not isinstance(digest_hashes, dict):
+        raise ReportValidationError("continuation manifest digest_hashes must be an object")
+    expected_digest_keys = {
+        source.digest_path
+        for source in manifest.source_files
+        if source.digest_path is not None
+    }
+    if set(digest_hashes) != expected_digest_keys or any(
+        not isinstance(value, str) for value in digest_hashes.values()
+    ):
+        raise ReportValidationError("continuation manifest digest_hashes do not match digest paths")
+    scope_hash = manifest_json.get("scope_hash")
+    if scope_hash is None:
+        raise ReportValidationError("continuation manifest lacks scope hash")
+    if scope_hash != _scope_hash(manifest.scope):
+        raise ReportValidationError("continuation manifest scope hash changed")
+    for source in manifest.source_files:
+        if not isinstance(source.source_path, str) or not source.source_path:
+            raise ReportValidationError("continuation manifest source_path must be a non-empty string")
+        if not isinstance(source.sha256, str) or not source.sha256:
+            raise ReportValidationError("continuation manifest source hash must be a non-empty string")
+        if source.digest_path is not None and not isinstance(source.digest_path, str):
+            raise ReportValidationError("continuation manifest digest_path must be a string")
+        source_path = Path(source.source_path)
+        if source_path.is_absolute():
+            raise ReportValidationError("continuation manifest source path must be relative")
+        try:
+            current_path = (source_root / source_path).resolve(strict=False)
+            current_path.relative_to(source_root)
+        except (OSError, ValueError) as exc:
+            raise ReportValidationError(
+                f"continuation source path escapes source root: {source.source_path}"
+            ) from exc
+        if not current_path.is_file():
+            raise ReportValidationError(
+                f"continuation source is missing from manifest: {source.source_path}"
+            )
+        try:
+            current_hash = _sha256(current_path)
+        except OSError as exc:
+            raise ReportValidationError(
+                f"cannot read continuation source: {source.source_path}"
+            ) from exc
+        if current_hash != source.sha256:
+            raise ReportValidationError(
+                f"continuation source hash changed: {source.source_path}"
+            )
+        if source.digest_path is None:
+            continue
+        digest_path = _continuation_path(source.digest_path, out_dir)
+        try:
+            digest_path.relative_to(run_root)
+        except ValueError as exc:
+            raise ReportValidationError(
+                f"continuation digest path escapes run directory: {source.digest_path}"
+            ) from exc
+        if not digest_path.is_file():
+            raise ReportValidationError(
+                f"continuation digest is missing from manifest: {source.digest_path}"
+            )
+        try:
+            current_digest_hash = _sha256(digest_path)
+        except OSError as exc:
+            raise ReportValidationError(
+                f"cannot read continuation digest: {source.digest_path}"
+            ) from exc
+        if digest_hashes[source.digest_path] != current_digest_hash:
+            raise ReportValidationError(
+                f"continuation digest hash changed: {source.digest_path}"
+            )
+
+
 def _load_manifest(out_dir: Path) -> DigestManifest | None:
     """Load a prior digest manifest for the host's miner continuation phase."""
     path = out_dir / "manifest.json"
@@ -85,7 +216,17 @@ def _load_manifest(out_dir: Path) -> DigestManifest | None:
         return None
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(value, dict):
+            raise ReportValidationError("continuation manifest must be an object")
+        if value.get("schema_version") != 1:
+            raise ReportValidationError("continuation manifest schema_version must be 1")
+        if not isinstance(value.get("complete"), bool):
+            raise ReportValidationError("continuation manifest complete must be boolean")
         scope_value = value["scope"]
+        if not isinstance(scope_value, dict):
+            raise ReportValidationError("continuation manifest scope must be an object")
+        if not isinstance(scope_value.get("include_subagents"), bool):
+            raise ReportValidationError("continuation manifest include_subagents must be boolean")
         since = str(scope_value["since"])
         if since.endswith("Z"):
             since = since[:-1] + "+00:00"
@@ -98,6 +239,9 @@ def _load_manifest(out_dir: Path) -> DigestManifest | None:
         from runtime import Runtime
 
         runtime = Runtime(value["runtime"])
+        raw_source_files = value["source_files"]
+        if not isinstance(raw_source_files, list):
+            raise ReportValidationError("continuation manifest source_files must be an array")
         source_files = tuple(
             SourceFile(
                 source_path=item["source_path"],
@@ -111,7 +255,7 @@ def _load_manifest(out_dir: Path) -> DigestManifest | None:
                 project=item.get("project", ""),
                 digest_path=item.get("digest_path"),
             )
-            for item in value["source_files"]
+            for item in raw_source_files
         )
         manifest = DigestManifest(
             schema_version=int(value["schema_version"]),
@@ -256,6 +400,106 @@ def _cluster_id(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", value.casefold()).strip("-")
 
 
+def _canonical_cluster_id(value: str, *, label: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ApplyApprovalError(f"{label} must be a non-empty cluster ID")
+    canonical = _cluster_id(value)
+    if not canonical:
+        raise ApplyApprovalError(f"{label} must contain letters or digits")
+    return canonical
+
+
+def _approved_ids(values: Iterable[str]) -> tuple[str, ...]:
+    result: list[str] = []
+    for value in values:
+        canonical = _canonical_cluster_id(value, label="approved cluster")
+        if canonical in result:
+            raise ApplyApprovalError(
+                f"ambiguous approved cluster IDs normalize to {canonical!r}"
+            )
+        result.append(canonical)
+    return tuple(result)
+
+
+def _candidate_map(candidates: Iterable[CandidateScore]) -> dict[str, CandidateScore]:
+    result: dict[str, CandidateScore] = {}
+    for candidate in candidates:
+        canonical = _canonical_cluster_id(candidate.cluster_key, label="candidate cluster")
+        previous = result.get(canonical)
+        if previous is not None and previous.cluster_key != candidate.cluster_key:
+            raise ApplyApprovalError(
+                f"ambiguous candidate cluster IDs normalize to {canonical!r}"
+            )
+        result[canonical] = candidate
+    return result
+
+
+def _request_map(values: Any) -> dict[str, ApplyRequest]:
+    if values is None:
+        return {}
+    if isinstance(values, Mapping):
+        raw_items = tuple(values.items())
+    else:
+        raw_items = tuple((None, value) for value in values)
+    result: dict[str, ApplyRequest] = {}
+    for supplied_id, request in raw_items:
+        if not isinstance(request, ApplyRequest):
+            raise ApplyApprovalError("apply_requests must contain ApplyRequest values")
+        canonical = _canonical_cluster_id(request.cluster_id, label="ApplyRequest cluster")
+        if supplied_id is not None and _canonical_cluster_id(
+            supplied_id, label="ApplyRequest mapping key"
+        ) != canonical:
+            raise ApplyApprovalError("ApplyRequest mapping key does not match request cluster_id")
+        if canonical in result:
+            raise ApplyApprovalError(
+                f"ambiguous ApplyRequest IDs normalize to {canonical!r}"
+            )
+        result[canonical] = request
+    return result
+
+
+def _workspace_map(values: Any) -> dict[str, WorkspaceState]:
+    if values is None:
+        return {}
+    if not isinstance(values, Mapping):
+        raise ApplyApprovalError("apply_workspaces must map cluster IDs to WorkspaceState")
+    result: dict[str, WorkspaceState] = {}
+    for key, workspace in values.items():
+        canonical = _canonical_cluster_id(key, label="workspace cluster")
+        if not isinstance(workspace, WorkspaceState):
+            raise ApplyApprovalError("apply_workspaces must contain WorkspaceState values")
+        if canonical in result:
+            raise ApplyApprovalError(
+                f"ambiguous workspace IDs normalize to {canonical!r}"
+            )
+        result[canonical] = workspace
+    return result
+
+
+def _proof_map(values: Any) -> dict[str, FixProof]:
+    if values is None:
+        return {}
+    if isinstance(values, Mapping):
+        raw_items = tuple(values.items())
+    else:
+        raw_items = tuple((None, value) for value in values)
+    result: dict[str, FixProof] = {}
+    for supplied_id, proof in raw_items:
+        if not isinstance(proof, FixProof):
+            raise ApplyApprovalError("apply_proofs must contain FixProof values")
+        canonical = _canonical_cluster_id(proof.cluster_id, label="FixProof cluster")
+        if supplied_id is not None and _canonical_cluster_id(
+            supplied_id, label="FixProof mapping key"
+        ) != canonical:
+            raise ApplyApprovalError("FixProof mapping key does not match proof cluster_id")
+        if canonical in result:
+            raise ApplyApprovalError(
+                f"ambiguous FixProof IDs normalize to {canonical!r}"
+            )
+        result[canonical] = proof
+    return result
+
+
 def _rank(
     findings: tuple[Finding, ...],
     analyzed_sessions: int,
@@ -274,17 +518,6 @@ def _rank(
         )
         candidates.append(score_candidate(cluster_key, metrics))
     return rank_candidates(candidates)
-
-
-def _ledger_path(out_dir: Path) -> Path | None:
-    candidates = (Path.cwd() / "clusters.yaml", out_dir.parent / "clusters.yaml")
-    for candidate in candidates:
-        try:
-            if candidate.is_file():
-                return candidate
-        except OSError:
-            continue
-    return None
 
 
 def _verify_ledger(
@@ -367,6 +600,18 @@ def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
                 pass
 
 
+def _persist_digest_hashes(out_dir: Path, manifest: DigestManifest) -> None:
+    path = out_dir / "manifest.json"
+    value = json.loads(path.read_text(encoding="utf-8"))
+    value["digest_hashes"] = {
+        source.digest_path: _sha256(_continuation_path(source.digest_path, out_dir))
+        for source in manifest.source_files
+        if source.digest_path is not None
+    }
+    value["scope_hash"] = _scope_hash(manifest.scope)
+    _atomic_json(path, value)
+
+
 def _report_payload(
     result_manifest: DigestManifest,
     ranked: tuple[CandidateScore, ...],
@@ -375,6 +620,9 @@ def _report_payload(
     inventory: Inventory,
     apply_requested: bool,
     approved_clusters: tuple[str, ...],
+    apply_previews: tuple[ApplyPreview, ...],
+    validated_proofs: tuple[str, ...],
+    ledger_path: Path | None,
 ) -> dict[str, Any]:
     return {
         "schema_version": 1,
@@ -388,8 +636,11 @@ def _report_payload(
         "apply": {
             "requested": apply_requested,
             "approved_clusters": approved_clusters,
-            "preview_created": False,
+            "preview_created": bool(apply_previews),
+            "previews": apply_previews,
+            "validated_proofs": validated_proofs,
         },
+        "ledger_path": ledger_path,
     }
 
 
@@ -405,6 +656,10 @@ def run_reflection(
     miner_report_paths: tuple[Path, ...],
     apply: bool,
     approved_clusters: tuple[str, ...] = (),
+    apply_requests: Iterable[ApplyRequest] | Mapping[str, ApplyRequest] | None = None,
+    apply_workspaces: Mapping[str, WorkspaceState] | None = None,
+    apply_proofs: Iterable[FixProof] | Mapping[str, FixProof] | None = None,
+    ledger_path: Path | None = None,
 ) -> ReflectionRun:
     """Run one complete reflection pass and write an atomic JSON report.
 
@@ -419,10 +674,23 @@ def run_reflection(
     if not isinstance(apply, bool):
         raise TypeError("apply must be a bool")
     approvals = tuple(approved_clusters)
-    if any(not isinstance(value, str) or not value.strip() for value in approvals):
-        raise ApplyApprovalError("cluster approvals must be non-empty IDs")
+    if not apply and approvals:
+        raise ApplyApprovalError("--approve-cluster is only valid with --apply")
     if apply and not approvals:
         raise ApplyApprovalError("Apply requires explicit cluster approval")
+    if not apply and any(value is not None for value in (apply_requests, apply_workspaces, apply_proofs)):
+        raise ApplyApprovalError("Apply inputs are only valid with --apply")
+    if apply and (apply_requests is None or apply_workspaces is None):
+        raise ApplyApprovalError(
+            "Apply requires matching ApplyRequest and WorkspaceState inputs"
+        )
+    if ledger_path is not None and not isinstance(ledger_path, Path):
+        raise TypeError("ledger_path must be a pathlib.Path")
+
+    normalized_approvals = _approved_ids(approvals)
+    requests = _request_map(apply_requests) if apply else {}
+    workspaces = _workspace_map(apply_workspaces) if apply else {}
+    proofs = _proof_map(apply_proofs) if apply else {}
 
     spec = resolve_runtime(
         runtime_name,
@@ -440,17 +708,20 @@ def run_reflection(
             or existing_manifest.scope.include_subagents != scope.include_subagents
         ):
             raise ReportValidationError("existing manifest scope does not match this run")
+        _validate_continuation_manifest(existing_manifest, spec, out_dir)
         # The host may need a few seconds between digest and miner phases;
         # retain the persisted cutoff as the authoritative continuation scope.
         scope = existing_manifest.scope
     manifest = existing_manifest or run_digest(spec, scope, out_dir)
+    if existing_manifest is None:
+        _persist_digest_hashes(out_dir, manifest)
     # IncompleteDigestError is intentionally raised by run_digest after the
     # manifest is persisted, and must stop before any miner report is read.
     reports = _load_reports(tuple(Path(path) for path in miner_report_paths), manifest)
     findings = merge_reports(reports, manifest) if reports else ()
     inventory = _inventory(spec)
     coverage = _coverage(inventory)
-    verification = _verify_ledger(findings, coverage, _ledger_path(out_dir))
+    verification = _verify_ledger(findings, coverage, ledger_path)
     regression_counts = {
         _cluster_id(item.cluster_id): 1
         for item in verification
@@ -458,14 +729,66 @@ def run_reflection(
     }
     ranked = _rank(findings, manifest.sessions_scanned, regression_counts)
 
-    approved = tuple(dict.fromkeys(value.strip() for value in approvals))
-    selected = {candidate.cluster_key for candidate in ranked}
+    previews: list[ApplyPreview] = []
+    validated_proofs: list[str] = []
+    selected = _candidate_map(ranked)
     if apply:
-        unknown = sorted(set(approved) - selected)
+        unknown = sorted(set(normalized_approvals) - set(selected))
         if unknown:
             raise ApplyApprovalError(
                 "approved cluster is not a ranked candidate: " + ", ".join(unknown)
             )
+        extra_requests = sorted(set(requests) - set(normalized_approvals))
+        if extra_requests:
+            raise ApplyApprovalError(
+                "ApplyRequest supplied for unapproved cluster: " + ", ".join(extra_requests)
+            )
+        missing_requests = sorted(set(normalized_approvals) - set(requests))
+        missing_workspaces = sorted(set(normalized_approvals) - set(workspaces))
+        if missing_requests or missing_workspaces:
+            missing = sorted(set(missing_requests) | set(missing_workspaces))
+            raise ApplyApprovalError(
+                "Apply requires matching ApplyRequest and WorkspaceState for: "
+                + ", ".join(missing)
+            )
+        extra_workspaces = sorted(set(workspaces) - set(normalized_approvals))
+        if extra_workspaces:
+            raise ApplyApprovalError(
+                "WorkspaceState supplied for unapproved cluster: "
+                + ", ".join(extra_workspaces)
+            )
+        extra_proofs = sorted(set(proofs) - set(normalized_approvals))
+        if extra_proofs:
+            raise ApplyApprovalError(
+                "FixProof supplied for unapproved cluster: " + ", ".join(extra_proofs)
+            )
+        for cluster_id in normalized_approvals:
+            request = requests[cluster_id]
+            normalized_request = ApplyRequest(
+                cluster_id,
+                request.target_paths,
+                request.commands,
+                request.verification_commands,
+            )
+            preview = build_preview(
+                normalized_request,
+                inventory=inventory,
+                workspace=workspaces[cluster_id],
+            )
+            for previous in previews:
+                overlap = check_scope_overlap(previous, preview)
+                if overlap is not None:
+                    raise ApplyApprovalError(
+                        "approved Apply previews overlap and must run serially: "
+                        + " and ".join(overlap)
+                    )
+            previews.append(preview)
+        for cluster_id, proof in proofs.items():
+            validate_proof(
+                next(preview for preview in previews if preview.request.cluster_id == cluster_id),
+                proof,
+            )
+            validated_proofs.append(cluster_id)
 
     report_path = Path(out_dir) / "reflection-report.json"
     _atomic_json(
@@ -478,11 +801,22 @@ def run_reflection(
                 verification,
                 inventory,
                 apply,
-                approved,
+                normalized_approvals,
+                tuple(previews),
+                tuple(validated_proofs),
+                ledger_path,
             )
         ),
     )
-    return ReflectionRun(manifest, report_path, ranked, coverage, None)
+    preview_tuple = tuple(previews)
+    return ReflectionRun(
+        manifest,
+        report_path,
+        ranked,
+        coverage,
+        preview_tuple[0] if preview_tuple else None,
+        preview_tuple,
+    )
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -496,6 +830,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--miner-report", type=Path, action="append", default=[])
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--approve-cluster", action="append", default=[])
+    parser.add_argument("--ledger", type=Path)
     parser.add_argument("--json", action="store_true")
     return parser
 
@@ -505,6 +840,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.since < 0:
         parser.error("--since must be non-negative")
+    if args.approve_cluster and not args.apply:
+        print("reflect-setup: --approve-cluster is only valid with --apply", file=sys.stderr)
+        return 2
     if args.apply and not args.approve_cluster:
         print("reflect-setup: Apply requires explicit cluster approval", file=sys.stderr)
         return 2
@@ -521,6 +859,7 @@ def main(argv: list[str] | None = None) -> int:
             miner_report_paths=tuple(args.miner_report),
             apply=args.apply,
             approved_clusters=tuple(args.approve_cluster),
+            ledger_path=args.ledger,
         )
     except (ApplyApprovalError, IncompleteDigestError, ReportValidationError, OSError, RuntimeError, ValueError) as exc:
         print(f"reflect-setup: {exc}", file=sys.stderr)

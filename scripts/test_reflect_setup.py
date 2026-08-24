@@ -1,4 +1,5 @@
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 import subprocess
@@ -6,8 +7,9 @@ import sys
 from tempfile import TemporaryDirectory
 
 from digest import IncompleteDigestError
+from apply import ApplyRequest, FixProof, WorkspaceState
 from miner_contract import ReportValidationError
-from reflect_setup import run_reflection
+from reflect_setup import ApplyApprovalError, run_reflection
 
 
 def run_cli(*args):
@@ -150,6 +152,273 @@ def test_reflection_continuation_validates_reports_and_writes_ranked_report():
         payload = json.loads(result.report_path.read_text())
         assert payload["manifest"]["run_id"] == manifest["run_id"]
         assert payload["ranked_candidates"][0]["metrics"]["projects"] == 1
+
+
+def _prepare_ranked_continuation(root):
+    source = root / "projects" / "project-a"
+    source.mkdir(parents=True)
+    (source / "session.jsonl").write_text(
+        '{"type":"user","timestamp":"2026-08-23T10:00:00Z",'
+        '"message":{"role":"user","content":"please fix this"}}\n'
+    )
+    kwargs = dict(
+        runtime_name="claude",
+        home=root,
+        source_root=root / "projects",
+        since=datetime(2026, 8, 23, tzinfo=timezone.utc),
+        project_filter=None,
+        include_subagents=False,
+        out_dir=root / "run",
+        apply=True,
+    )
+    try:
+        run_reflection(miner_report_paths=(), apply=False, **{key: value for key, value in kwargs.items() if key != "apply"})
+    except ReportValidationError:
+        pass
+    manifest = json.loads((root / "run" / "manifest.json").read_text())
+    digest_path = manifest["source_files"][0]["digest_path"]
+    report = root / "miner-report.json"
+    report.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "runtime": "claude",
+                "run_id": manifest["run_id"],
+                "batch_id": "batch-a",
+                "digest_paths": [digest_path],
+                "findings": [
+                    {
+                        "cluster_key": "repeat-fix",
+                        "finding_type": "failure",
+                        "session_id": "session",
+                        "paraphrase": "the same fix is requested",
+                        "occurrence_count": 1,
+                        "confidence": 0.9,
+                        "evidence": [
+                            {
+                                "digest_path": digest_path,
+                                "source_line": 1,
+                                "timestamp": "2026-08-23T10:00:00Z",
+                                "kind": "failure",
+                                "project": "project-a",
+                            }
+                        ],
+                    }
+                ],
+                "themes": [],
+            }
+        )
+    )
+    return kwargs, report, manifest
+
+
+def test_apply_requires_typed_request_and_workspace_and_cli_rejects_bare_approval():
+    with TemporaryDirectory() as raw:
+        root = Path(raw)
+        source = root / "projects"
+        source.mkdir()
+        completed = run_cli(
+            "--runtime", "claude",
+            "--source-root", str(source),
+            "--approve-cluster", "candidate",
+            "--out", str(root / "run"),
+        )
+        assert completed.returncode != 0
+        assert "--apply" in completed.stderr
+        completed = run_cli(
+            "--runtime", "claude",
+            "--source-root", str(source),
+            "--apply",
+            "--approve-cluster", "candidate",
+            "--out", str(root / "run-without-request"),
+        )
+        assert completed.returncode != 0
+        assert "ApplyRequest" in completed.stderr
+        try:
+            run_reflection(
+                runtime_name="claude",
+                home=root,
+                source_root=source,
+                since=datetime(2026, 8, 23, tzinfo=timezone.utc),
+                project_filter=None,
+                include_subagents=False,
+                out_dir=root / "api-run",
+                miner_report_paths=(),
+                apply=True,
+                approved_clusters=("candidate",),
+            )
+        except ApplyApprovalError as exc:
+            assert "ApplyRequest" in str(exc)
+            assert not (root / "api-run").exists()
+        else:
+            raise AssertionError("Apply without typed request/workspace must fail closed")
+
+
+def test_apply_builds_previews_for_exact_approved_ids_and_validates_proof():
+    with TemporaryDirectory() as raw:
+        root = Path(raw)
+        kwargs, report, _ = _prepare_ranked_continuation(root)
+        workspace = WorkspaceState(root / "projects" / "project-a", (), False)
+        request = ApplyRequest(
+            "Repeat Fix",
+            (Path("fix.md"),),
+            ("fix command",),
+            ("verify command",),
+        )
+        result = run_reflection(
+            miner_report_paths=(report,),
+            approved_clusters=("repeat-fix",),
+            apply_requests=(request,),
+            apply_workspaces={"repeat-fix": workspace},
+            **kwargs,
+        )
+        assert len(result.apply_previews) == 1
+        assert result.apply_preview == result.apply_previews[0]
+        assert result.apply_previews[0].request.cluster_id == "repeat-fix"
+
+        proof = FixProof(
+            "repeat-fix",
+            (Path("fix.md"),),
+            ("fix command completed",),
+            ("verify command :: PASS",),
+            True,
+        )
+        proven = run_reflection(
+            miner_report_paths=(report,),
+            approved_clusters=("repeat-fix",),
+            apply_requests=(request,),
+            apply_workspaces={"repeat-fix": workspace},
+            apply_proofs=(proof,),
+            **kwargs,
+        )
+        payload = json.loads(proven.report_path.read_text())
+        assert payload["apply"]["validated_proofs"] == ["repeat-fix"]
+
+
+def test_apply_rejects_approval_id_collisions_after_kebab_normalization():
+    with TemporaryDirectory() as raw:
+        root = Path(raw)
+        kwargs, report, _ = _prepare_ranked_continuation(root)
+        workspace = WorkspaceState(root / "projects" / "project-a", (), False)
+        request = ApplyRequest("repeat-fix", (Path("fix.md"),), ("fix",), ("verify",))
+        try:
+            run_reflection(
+                miner_report_paths=(report,),
+                approved_clusters=("repeat fix", "repeat-fix"),
+                apply_requests=(request,),
+                apply_workspaces={"repeat-fix": workspace},
+                **kwargs,
+            )
+        except ApplyApprovalError as exc:
+            assert "ambiguous" in str(exc)
+        else:
+            raise AssertionError("normalized approval collisions must fail closed")
+
+
+def test_continuation_rejects_changed_source_before_trusting_reports():
+    with TemporaryDirectory() as raw:
+        root = Path(raw)
+        kwargs, report, _ = _prepare_ranked_continuation(root)
+        source_file = root / "projects" / "project-a" / "session.jsonl"
+        source_file.write_text(source_file.read_text() + "\n")
+        try:
+            run_reflection(
+                miner_report_paths=(report,),
+                apply=False,
+                **{key: value for key, value in kwargs.items() if key != "apply"},
+            )
+        except ReportValidationError as exc:
+            assert "source" in str(exc)
+        else:
+            raise AssertionError("changed source must invalidate continuation")
+
+
+def test_continuation_rejects_tampered_digest_path():
+    with TemporaryDirectory() as raw:
+        root = Path(raw)
+        kwargs, report, manifest = _prepare_ranked_continuation(root)
+        manifest_path = root / "run" / "manifest.json"
+        value = json.loads(manifest_path.read_text())
+        value["source_files"][0]["digest_path"] = str(root / "outside.md")
+        manifest_path.write_text(json.dumps(value))
+        try:
+            run_reflection(
+                miner_report_paths=(report,),
+                apply=False,
+                **{key: value for key, value in kwargs.items() if key != "apply"},
+            )
+        except ReportValidationError as exc:
+            assert "digest" in str(exc)
+        else:
+            raise AssertionError("tampered digest path must invalidate continuation")
+
+
+def test_continuation_rejects_changed_digest_bytes():
+    with TemporaryDirectory() as raw:
+        root = Path(raw)
+        kwargs, report, manifest = _prepare_ranked_continuation(root)
+        digest_path = Path(manifest["source_files"][0]["digest_path"])
+        digest_path.write_text(digest_path.read_text() + "tampered\n")
+        try:
+            run_reflection(
+                miner_report_paths=(report,),
+                apply=False,
+                **{key: value for key, value in kwargs.items() if key != "apply"},
+            )
+        except ReportValidationError as exc:
+            assert "digest hash" in str(exc)
+        else:
+            raise AssertionError("changed digest bytes must invalidate continuation")
+
+
+def test_continuation_rejects_tampered_scope_metadata():
+    with TemporaryDirectory() as raw:
+        root = Path(raw)
+        kwargs, report, _ = _prepare_ranked_continuation(root)
+        manifest_path = root / "run" / "manifest.json"
+        value = json.loads(manifest_path.read_text())
+        value["scope"]["since"] = "2026-08-22T00:00:00Z"
+        manifest_path.write_text(json.dumps(value))
+        try:
+            run_reflection(
+                miner_report_paths=(report,),
+                apply=False,
+                **{key: value for key, value in kwargs.items() if key != "apply"},
+            )
+        except ReportValidationError as exc:
+            assert "scope hash" in str(exc)
+        else:
+            raise AssertionError("tampered scope metadata must invalidate continuation")
+
+
+def test_ledger_is_only_read_when_explicitly_supplied():
+    with TemporaryDirectory() as raw:
+        root = Path(raw)
+        kwargs, report, _ = _prepare_ranked_continuation(root)
+        ledger = root / "clusters.yaml"
+        ledger.write_text(
+            "- id: repeat-fix\n"
+            "  status: fix-applied\n"
+            "  wired_check: repeat-fix\n"
+        )
+        previous = Path.cwd()
+        os.chdir(root)
+        try:
+            implicit = run_reflection(
+                miner_report_paths=(report,),
+                apply=False,
+                **{key: value for key, value in kwargs.items() if key != "apply"},
+            )
+        finally:
+            os.chdir(previous)
+        assert json.loads(implicit.report_path.read_text())["verification"] == []
+        explicit = run_reflection(
+            miner_report_paths=(report,),
+            ledger_path=ledger,
+            apply=False,
+            **{key: value for key, value in kwargs.items() if key != "apply"},
+        )
+        assert len(json.loads(explicit.report_path.read_text())["verification"]) == 1
 
 
 if __name__ == "__main__":

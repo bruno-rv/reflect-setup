@@ -59,7 +59,10 @@ rejected rather than reused.
 
 When the first phase stops because reports are not yet available, host miners
 may run over the persisted digest files. A later invocation with the same run
-directory reuses its complete manifest and validates reports against it.
+directory reuses its complete manifest only after validating schema, runtime,
+scope, source paths and SHA-256 hashes, and every digest path's existence,
+run-directory containment, and persisted digest hash. Changed source or digest
+bytes, deleted files, path escapes, or tampered manifest metadata fail closed.
 
 ## Miner contract and batches
 
@@ -139,8 +142,10 @@ then cluster key.
 The orchestrator writes `reflection-report.json` atomically beside the digest
 manifest. It includes the manifest, runtime inventory, coverage records,
 verification results, ranked candidates, and Apply approval metadata. The report
-is not a substitute for host notes or ledger updates and is never written when
-the digest is incomplete.
+is not a substitute for host notes or ledger updates. Python writes no notes or
+ledger state, and never writes a report when the digest is incomplete. Pass
+`--ledger PATH` (or `ledger_path=...` in the API) when explicit ledger
+verification is wanted; no implicit current-directory ledger is read.
 
 ## Apply
 
@@ -151,6 +156,27 @@ and verification commands. `scripts/apply.py` rejects path escapes, unresolved
 workspace conflicts, overlapping parallel scopes, duplicate commands, and
 unapproved new paths.
 
+The API requires typed host inputs for every approved ID:
+
+```python
+run_reflection(
+    ...,
+    apply=True,
+    approved_clusters=("stable-cluster-id",),
+    apply_requests=(apply_request,),
+    apply_workspaces={"stable-cluster-id": workspace_state},
+)
+```
+
+Approval IDs, candidate IDs, request IDs, workspace keys, and proof IDs are
+normalized to stable kebab slugs. Duplicate or ambiguous normalized IDs fail
+closed. The result exposes `apply_previews` (and the legacy first-preview
+`apply_preview` field). Previews are created exactly for approved clusters;
+scope overlaps fail before any host execution. A `FixProof` is optional for a
+preview-only pass, but every supplied proof is checked with
+`validate_proof()` before Python reports it as validated. Python never executes
+fixer commands or changes project files.
+
 Fixers must return non-empty output and `passed=True`. Every declared
 verification command must appear exactly once as the byte-exact record:
 
@@ -159,9 +185,11 @@ verification command must appear exactly once as the byte-exact record:
 ```
 
 Any explicit failure status, missing/unknown/non-PASS record, or failed command
-invalidates the proof. Python does not execute host task/fixer commands; the
-Claude or Codex workflow owns dispatch and shows the resulting diff and proof
-before updating the ledger.
+invalidates the proof. The host must obtain consent, execute through its active
+workflow, and only then supply proof and update notes/ledger. Claude uses its
+configured task/subagent delegation; Codex uses its configured
+worker/subagent delegation. These instructions describe concepts, not assumed
+tool names.
 
 ## Direct checks
 

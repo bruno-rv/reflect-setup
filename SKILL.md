@@ -40,12 +40,13 @@ exist. The detailed operator contract is in `REFERENCE.md`.
 7. **Rank** — calculate normalized trend metrics and the deterministic candidate
    score, including recurrence, sessions, projects, days, confidence, impact,
    regressions, and implementation cost. [Detail](REFERENCE.md#ranking)
-8. **Write report/notes** — write the atomic `reflection-report.json` and append
-   the host's local notes/ledger updates. Diagnosis does not mutate project
-   files. [Detail](REFERENCE.md#report-output)
-9. **Apply (optional, opt-in)** — ask for approval per selected cluster, build a
-   bounded preview, dispatch the host fixer, and require exact command plus
-   verification proof before any ledger transition. [Detail](REFERENCE.md#apply)
+8. **Write report** — write the atomic `reflection-report.json`. The host then
+   appends its local notes and, when explicitly authorized, updates its ledger;
+   this Python core does not perform those host mutations. [Detail](REFERENCE.md#report-output)
+9. **Apply (optional, opt-in)** — the host asks for approval per selected
+   cluster, supplies an `ApplyRequest` and `WorkspaceState`, inspects bounded
+   previews, dispatches the host fixer, and supplies exact proof before any
+   ledger transition. [Detail](REFERENCE.md#apply)
 
 ## CLI
 
@@ -56,14 +57,32 @@ PYTHONPATH=scripts python3 scripts/reflect_setup.py \
 
 Use `--miner-report PATH` once each host miner has returned its JSON report.
 Use `--include-subagents` only when sidechain material is intentionally in
-scope. `--apply` requires one or more repeated `--approve-cluster ID` flags;
-the Python core never guesses or invokes a Claude/Codex task tool.
+scope. `--ledger PATH` is required when the host wants Python to verify ledger
+entries; no implicit current-directory ledger is read. `--apply` requires one
+or more repeated `--approve-cluster ID` flags plus typed request/workspace
+inputs through `run_reflection()`; a bare CLI approval fails closed. The Python
+core never guesses or invokes a Claude/Codex task tool.
 
 ## Hard constraints
 
 - Runtime selection is explicit when auto-detection is ambiguous.
 - Event timestamps, not filesystem mtimes, determine scope.
 - A partial manifest or incomplete batch cannot be reported as complete.
-- Diagnosis writes only the local manifest, scratch digests, report, notes, and
-  ledger; Apply is never implicit.
+- Python writes only the local manifest, scratch digests, and report. The host
+  owns notes/ledger updates; Apply is never implicit.
 - No privacy, redaction, or retention behavior is added by this skill.
+
+## Host dispatch concepts
+
+- **Claude Code:** use the active Claude host's configured task/subagent
+  delegation to launch one bounded miner per digest batch. Collect each JSON
+  report, resume the Python run, then obtain consent before constructing one
+  request/workspace pair per approved cluster. Dispatch fixers through that
+  same host mechanism and return command output plus exact `:: PASS` records.
+- **Codex:** use the active Codex host's configured worker/subagent delegation
+  for the same one-batch/one-report flow. After consent, construct the typed
+  request/workspace inputs, inspect Python previews, execute the approved fix
+  through the active Codex workflow, and return a validated `FixProof`.
+
+Neither flow assumes a particular task-tool name. The host owns execution;
+Python validates manifests, reports, previews, and proofs.

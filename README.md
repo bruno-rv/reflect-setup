@@ -68,7 +68,29 @@ PYTHONPATH=scripts python3 scripts/reflect_setup.py \
 
 Reports must cover every non-empty digest path exactly once. Use
 `--include-subagents` to opt into sidechains. Apply additionally requires
-repeated `--approve-cluster ID` flags and host-side fixer proof.
+repeated `--approve-cluster ID` flags, an explicit `--ledger PATH` when ledger
+verification is wanted, and host-supplied typed request/workspace inputs. A
+bare CLI approval fails closed; the host performs fixer execution and notes or
+ledger updates after Python validates previews and optional `FixProof` values.
+
+## Host workflow
+
+Claude Code and Codex use the same sequence but their hosts choose their own
+available delegation mechanism:
+
+1. Delegate one bounded miner worker per digest batch and collect JSON reports.
+2. Resume `reflect_setup.py` with those reports and inspect the ranked report.
+3. Ask for explicit consent per cluster. The host constructs an
+   `ApplyRequest` and `WorkspaceState`, then calls `run_reflection(...,
+   apply=True, approved_clusters=..., apply_requests=...,
+   apply_workspaces=...)` to obtain bounded previews.
+4. Execute only after preview consent, collect a `FixProof`, and call the API
+   with `apply_proofs=...`. The host then updates notes/ledger using its own
+   workflow.
+
+Claude uses its configured task/subagent delegation for steps 1 and 4; Codex
+uses its configured worker/subagent delegation. No unavailable tool name is
+assumed by the shared Python core.
 
 ## Structure
 
