@@ -682,7 +682,7 @@ def _verify_ledger(
                 outcome_evidence=(),
                 merged_findings=normalized_clusters.get(_cluster_id(entry.cluster_id), ()),
                 coverage_records=coverage,
-                target_artifact_ids=(entry.wired_check,),
+                target_artifact_ids=entry.artifact_ids,
             )
         )
     return tuple(results)

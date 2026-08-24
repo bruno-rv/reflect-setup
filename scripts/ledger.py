@@ -38,6 +38,7 @@ class LedgerEntry:
     cluster_id: str
     status: LedgerStatus
     wired_check: str
+    artifact_ids: tuple[str, ...]
 
 
 class LedgerParseError(ValueError):
@@ -65,6 +66,7 @@ _ALLOWED_FIELDS = frozenset(
         "evidence",
         "fix",
         "wired_check",
+        "artifact_ids",
     }
 )
 _REQUIRED_WIRED_CHECK = frozenset(
@@ -221,6 +223,8 @@ def _validate_fields(fields: Mapping[str, tuple[int, Any, str]], entry_index: in
         wired_check = fields["wired_check"][1]
         if not isinstance(wired_check, str) or not wired_check.strip():
             raise LedgerParseError(f"{prefix} with status {status.value} requires non-empty wired_check")
+        if "artifact_ids" not in fields:
+            raise LedgerParseError(f"{prefix} with status {status.value} requires artifact_ids")
     else:
         wired_check = fields.get("wired_check", (0, "", ""))[1]
         if not isinstance(wired_check, str):
@@ -241,7 +245,16 @@ def _validate_fields(fields: Mapping[str, tuple[int, Any, str]], entry_index: in
             or any(not isinstance(item, str) for item in fields[key][1])
         ):
             raise LedgerParseError(f"{prefix} {key} must be a bracketed string list")
-    return LedgerEntry(cluster_id.strip(), status, wired_check)
+    artifact_ids = fields.get("artifact_ids", (0, [], ""))[1]
+    if "artifact_ids" in fields and (
+        not isinstance(artifact_ids, list)
+        or any(not isinstance(item, str) or not item.strip() for item in artifact_ids)
+        or len(set(artifact_ids)) != len(artifact_ids)
+    ):
+        raise LedgerParseError(f"{prefix} artifact_ids must be a list of unique strings")
+    if status in _REQUIRED_WIRED_CHECK and not artifact_ids:
+        raise LedgerParseError(f"{prefix} with status {status.value} requires non-empty artifact_ids")
+    return LedgerEntry(cluster_id.strip(), status, wired_check, tuple(item.strip() for item in artifact_ids))
 
 
 def _parse_document(text: str) -> tuple[tuple[LedgerEntry, ...], list[_LedgerBlock]]:
@@ -423,21 +436,26 @@ def _replace_field(lines: list[str], block: _LedgerBlock, key: str, value: Any) 
     block.fields[key] = (insert_at, value, rendered)
 
 
-def _status_update(current: LedgerStatus, update: Any) -> tuple[LedgerStatus | None, str | None]:
+def _status_update(
+    current: LedgerStatus,
+    update: Any,
+) -> tuple[LedgerStatus | None, str | None, tuple[str, ...] | None]:
     if isinstance(update, LedgerEntry):
         if (
             update.status is not current
             and (current in _REQUIRED_WIRED_CHECK or update.status in _REQUIRED_WIRED_CHECK)
         ):
             raise LedgerTransitionError("operating-state updates require explicit verification")
-        return update.status, update.wired_check or None
+        if update.status in _REQUIRED_WIRED_CHECK and not update.artifact_ids:
+            raise LedgerTransitionError("operating-state updates require artifact_ids")
+        return update.status, update.wired_check or None, update.artifact_ids or None
     if isinstance(update, LedgerStatus):
         if (
             update is not current
             and (current in _REQUIRED_WIRED_CHECK or update in _REQUIRED_WIRED_CHECK)
         ):
             raise LedgerTransitionError("operating-state updates require explicit verification")
-        return update, None
+        return update, None, None
     if isinstance(update, str):
         try:
             target = LedgerStatus(update)
@@ -445,7 +463,7 @@ def _status_update(current: LedgerStatus, update: Any) -> tuple[LedgerStatus | N
             raise LedgerTransitionError(f"unknown requested ledger status: {update!r}") from exc
         return _status_update(current, target)
     if hasattr(update, "symptom") and hasattr(update, "invocation") and hasattr(update, "outcome"):
-        return validate_transition(current, update), None
+        return validate_transition(current, update), None, None
     if isinstance(update, tuple) and len(update) == 2:
         requested, verification = update
         if isinstance(requested, (LedgerStatus, str)):
@@ -454,7 +472,7 @@ def _status_update(current: LedgerStatus, update: Any) -> tuple[LedgerStatus | N
                     LedgerStatus(requested)
                 except ValueError as exc:
                     raise LedgerTransitionError(f"unknown requested ledger status: {requested!r}") from exc
-                return validate_transition(current, verification), None
+                return validate_transition(current, verification), None, None
             return _status_update(current, requested)
     raise LedgerTransitionError(f"unsupported ledger update for {current.value}")
 
@@ -553,12 +571,17 @@ def update_ledger(
     for cluster_id in reversed(list(updates)):
         block = block_by_id[cluster_id]
         current = by_id[cluster_id]
-        target_status, target_wired_check = _status_update(current.status, updates[cluster_id])
+        target_status, target_wired_check, target_artifact_ids = _status_update(
+            current.status,
+            updates[cluster_id],
+        )
         if target_status is not None and target_status is not current.status:
             _replace_field(lines, block, "status", target_status)
-            current = LedgerEntry(current.cluster_id, target_status, current.wired_check)
+            current = LedgerEntry(current.cluster_id, target_status, current.wired_check, current.artifact_ids)
         if target_wired_check:
             _replace_field(lines, block, "wired_check", target_wired_check)
+        if target_artifact_ids:
+            _replace_field(lines, block, "artifact_ids", list(target_artifact_ids))
 
         findings = grouped.get(cluster_id, ())
         if not findings:

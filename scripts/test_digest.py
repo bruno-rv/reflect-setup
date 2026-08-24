@@ -479,15 +479,11 @@ def test_codex_run_filters_subagent_threads_and_records_manifest_paths():
         spec = resolve_runtime("codex", home=root, env={}, source_root=source_root)
         scope = Scope(datetime(2026, 8, 23, tzinfo=timezone.utc), None, False)
         manifest = run_digest(spec, scope, root / "out")
-        assert manifest.sessions_scanned == 2
+        assert manifest.sessions_scanned == 1
         assert manifest.sessions_with_signals == 1
         assert manifest.signal_counts["user"] == 1
-        assert [source.source_path for source in manifest.source_files] == [
-            "canonical.jsonl",
-            "subagent.jsonl",
-        ]
+        assert [source.source_path for source in manifest.source_files] == ["canonical.jsonl"]
         assert manifest.source_files[0].digest_path is not None
-        assert manifest.source_files[1].digest_path is None
         assert manifest.source_files[0].project == "project__with__underscores"
         assert json.loads((root / "out" / "manifest.json").read_text())["source_files"][0]["project"] == "project__with__underscores"
         assert "# project: project__with__underscores" in next((root / "out").glob("*.md")).read_text()

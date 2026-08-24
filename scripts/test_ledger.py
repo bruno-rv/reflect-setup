@@ -6,7 +6,7 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from ledger import LedgerParseError, LedgerStatus, LedgerTransitionError, parse_ledger, update_ledger, validate_transition
+from ledger import LedgerEntry, LedgerParseError, LedgerStatus, LedgerTransitionError, parse_ledger, update_ledger, validate_transition
 from test_support import make_findings
 
 
@@ -49,11 +49,33 @@ def test_resolved_with_invocation_or_outcome_failure_becomes_built_not_operating
 
 
 def test_parser_accepts_example_subset_and_statuses():
-    source = """# comment\n- id: fixture\n  title: \"Fixture title\"\n  status: built-not-operating\n  first_seen: 2026-08-23\n  last_seen: 2026-08-24\n  sessions: 2\n  projects: [one, two]\n  evidence: [session-a, session-b]\n  fix: \"wire the hook\"\n  wired_check: \"next run invokes the hook\"\n"""
+    source = """# comment\n- id: fixture\n  title: \"Fixture title\"\n  status: built-not-operating\n  first_seen: 2026-08-23\n  last_seen: 2026-08-24\n  sessions: 2\n  projects: [one, two]\n  evidence: [session-a, session-b]\n  fix: \"wire the hook\"\n  wired_check: \"next run invokes the hook\"\n  artifact_ids: [fixture/SKILL.md]\n"""
     entries = parse_ledger(source)
     assert entries[0].cluster_id == "fixture"
     assert entries[0].status is LedgerStatus.BUILT_NOT_OPERATING
     assert entries[0].wired_check == "next run invokes the hook"
+
+
+def test_parser_requires_stable_artifact_ids_for_operating_entries():
+    source = """- id: fixture
+  status: fix-applied
+  wired_check: "next run invokes the hook"
+  artifact_ids: [fixture/SKILL.md]
+"""
+    entries = parse_ledger(source)
+    assert entries[0].artifact_ids == ("fixture/SKILL.md",)
+    assert entries[0].wired_check == "next run invokes the hook"
+
+    missing = """- id: fixture
+  status: resolved
+  wired_check: "next run invokes the hook"
+"""
+    try:
+        parse_ledger(missing)
+    except LedgerParseError as exc:
+        assert "artifact_ids" in str(exc)
+    else:
+        raise AssertionError("operating entries require stable artifact ids")
 
 
 def test_parser_rejects_duplicate_ids_and_missing_wired_check():
@@ -91,7 +113,7 @@ def test_parser_rejects_duplicate_ids_and_missing_wired_check():
 
 
 def test_update_ledger_touches_one_entry_and_preserves_comments_and_fields():
-    source = """# header\n- id: fixture\n  title: \"Fixture title\"\n  status: fix-applied\n  first_seen: 2026-08-23\n  last_seen: 2026-08-23\n  sessions: 1\n  projects: [one]\n  evidence: [session-a]\n  fix: \"wire the hook\"\n  wired_check: \"next run invokes the hook\"\n- id: unrelated\n  title: \"Keep me\"\n  status: monitor\n  sessions: 4\n  projects: [two]\n  evidence: [session-z]\n  fix: \"none\"\n  wired_check: \"observe\"\n"""
+    source = """# header\n- id: fixture\n  title: \"Fixture title\"\n  status: fix-applied\n  first_seen: 2026-08-23\n  last_seen: 2026-08-23\n  sessions: 1\n  projects: [one]\n  evidence: [session-a]\n  fix: \"wire the hook\"\n  wired_check: \"next run invokes the hook\"\n  artifact_ids: [fixture/SKILL.md]\n- id: unrelated\n  title: \"Keep me\"\n  status: monitor\n  sessions: 4\n  projects: [two]\n  evidence: [session-z]\n  fix: \"none\"\n  wired_check: \"observe\"\n"""
     findings = make_findings(1, ("session-b",), ("project-a",), ("2026-08-24",))
     verification = make_verification("pass", "pass", "pass")
     updated = update_ledger(source, {"fixture": verification}, merged_findings=findings)
@@ -101,6 +123,27 @@ def test_update_ledger_touches_one_entry_and_preserves_comments_and_fields():
     assert "sessions: 2" in updated
     assert "last_seen: 2026-08-24" in updated
     assert "status: monitor" in updated
+
+
+def test_update_ledger_persists_declared_artifact_ids_from_entry_update():
+    source = """- id: fixture
+  status: fix-applied
+  wired_check: "next run invokes the fixture skill"
+  artifact_ids: [old/SKILL.md]
+"""
+    updated = update_ledger(
+        source,
+        {
+            "fixture": LedgerEntry(
+                "fixture",
+                LedgerStatus.FIX_APPLIED,
+                "next run invokes the fixture skill",
+                ("fixture/SKILL.md",),
+            )
+        },
+    )
+    assert "artifact_ids: [fixture/SKILL.md]" in updated
+    assert "wired_check: \"next run invokes the fixture skill\"" in updated
 
 
 def test_update_ledger_can_write_a_path():
@@ -128,7 +171,7 @@ def test_update_ledger_uses_minimum_first_seen_date():
 
 
 def test_operating_state_status_update_requires_verification():
-    source = "- id: fixture\n  status: fix-applied\n  wired_check: \"observe\"\n"
+    source = "- id: fixture\n  status: fix-applied\n  wired_check: \"observe\"\n  artifact_ids: [fixture/SKILL.md]\n"
     for requested in (LedgerStatus.RESOLVED, "resolved"):
         try:
             update_ledger(source, {"fixture": requested})
@@ -139,7 +182,7 @@ def test_operating_state_status_update_requires_verification():
 
 
 def test_tuple_status_update_uses_verification_for_valid_and_invalid_paths():
-    source = "- id: fixture\n  status: fix-applied\n  wired_check: \"observe\"\n"
+    source = "- id: fixture\n  status: fix-applied\n  wired_check: \"observe\"\n  artifact_ids: [fixture/SKILL.md]\n"
     passing = make_verification("pass", "pass", "pass")
     updated = update_ledger(source, {"fixture": (LedgerStatus.RESOLVED, passing)})
     assert "status: resolved" in updated

@@ -389,7 +389,9 @@ repair or routing.
 
 ## Fix-wiring verification and ledger semantics
 
-Every `fix-applied` ledger entry gets three explicit checks:
+Every `fix-applied` ledger entry gets three explicit checks. Its stable
+`artifact_ids` identify the runtime artifacts whose typed coverage may satisfy
+invocation and outcome checks; `wired_check` remains human-readable prose.
 
 ```python
 class LedgerStatus(str, Enum):
@@ -406,6 +408,7 @@ class LedgerEntry:
     cluster_id: str
     status: LedgerStatus
     wired_check: str
+    artifact_ids: tuple[str, ...]
 
 
 class CheckStatus(str, Enum):
@@ -474,7 +477,8 @@ State transitions are strict:
 
 Absence of a mined signal alone never resolves a cluster. The ledger example
 and validator add `built-not-operating` to the accepted statuses and require a
-`wired_check` for `fix-applied`, `built-not-operating`, and `resolved` entries.
+`wired_check` plus non-empty `artifact_ids` for `fix-applied`,
+`built-not-operating`, and `resolved` entries.
 
 ## Trends and ranking
 

@@ -155,6 +155,45 @@ def test_reflection_continuation_validates_reports_and_writes_ranked_report():
         assert payload["ranked_candidates"][0]["metrics"]["projects"] == 1
 
 
+def test_codex_continuation_matches_canonical_session_scope_with_subagents():
+    for include_subagents, expected_paths in (
+        (False, ("canonical.jsonl",)),
+        (True, ("canonical.jsonl", "subagent.jsonl")),
+    ):
+        with TemporaryDirectory() as raw:
+            root = Path(raw)
+            source_root = root / "sessions"
+            source_root.mkdir()
+            (source_root / "canonical.jsonl").write_text(
+                '{"type":"session_meta","timestamp":"2026-08-23T10:00:00Z",'
+                '"payload":{"id":"canonical-1","thread_source":"user",'
+                '"cwd":"/tmp/project-a"}}\n'
+            )
+            (source_root / "subagent.jsonl").write_text(
+                '{"type":"session_meta","timestamp":"2026-08-23T10:00:00Z",'
+                '"payload":{"id":"subagent-1","thread_source":"subagent",'
+                '"cwd":"/tmp/project-a"}}\n'
+            )
+            kwargs = dict(
+                runtime_name="codex",
+                home=root,
+                source_root=source_root,
+                since=datetime(2026, 8, 23, tzinfo=timezone.utc),
+                project_filter=None,
+                include_subagents=include_subagents,
+                out_dir=root / "run",
+                apply=False,
+            )
+            first = run_reflection(miner_report_paths=(), **kwargs)
+            second = run_reflection(miner_report_paths=(), **kwargs)
+            assert tuple(
+                source.source_path for source in first.manifest.source_files
+            ) == expected_paths
+            assert tuple(
+                source.source_path for source in second.manifest.source_files
+            ) == expected_paths
+
+
 def _prepare_ranked_continuation(root):
     source = root / "projects" / "project-a"
     source.mkdir(parents=True)
@@ -400,7 +439,8 @@ def test_ledger_is_only_read_when_explicitly_supplied():
         ledger.write_text(
             "- id: repeat-fix\n"
             "  status: fix-applied\n"
-            "  wired_check: repeat-fix\n"
+            "  wired_check: next run invokes the fix\n"
+            "  artifact_ids: [repeat-fix]\n"
         )
         previous = Path.cwd()
         os.chdir(root)
@@ -433,7 +473,8 @@ def test_orchestration_requires_typed_host_coverage_for_operating_states():
         ledger.write_text(
             "- id: repeat-fix\n"
             "  status: fix-applied\n"
-            "  wired_check: fixture/SKILL.md\n"
+            "  wired_check: next run invokes the fixture skill\n"
+            "  artifact_ids: [fixture/SKILL.md]\n"
         )
         digest_path = manifest["source_files"][0]["digest_path"]
         coverage = CoverageObservation(

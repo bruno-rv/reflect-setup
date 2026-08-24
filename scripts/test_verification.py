@@ -146,6 +146,62 @@ def test_independent_inventory_coverage_can_supply_invocation_and_outcome():
     assert result.overall is CheckStatus.PASS
 
 
+def test_coverage_uses_declared_artifact_id_instead_of_human_wired_check():
+    from coverage_model import assess_coverage
+    from test_support import make_evidence
+
+    record = assess_coverage(
+        artifact_id="fixture/SKILL.md",
+        artifact_kind="skill",
+        exists=True,
+        eligible=True,
+        trigger_evidence=(make_evidence("trigger.md", 3, "trigger"),),
+        prevention_evidence=(make_evidence("outcome.md", 8, "outcome"),),
+        symptom_recurred=False,
+    )
+    result = verify_fix(
+        make_entry(
+            "fixture",
+            wired_check="next run invokes the fixture skill",
+            artifact_ids=("fixture/SKILL.md",),
+        ),
+        symptom_evidence=make_evidence_set("symptom-absent"),
+        invocation_evidence=(),
+        outcome_evidence=(),
+        coverage_records=(record,),
+    )
+    assert result.invocation.status is CheckStatus.PASS
+    assert result.outcome.status is CheckStatus.PASS
+
+
+def test_unlisted_artifact_coverage_cannot_contribute_even_when_wired_check_mentions_it():
+    from coverage_model import assess_coverage
+    from test_support import make_evidence
+
+    record = assess_coverage(
+        artifact_id="fixture/SKILL.md",
+        artifact_kind="skill",
+        exists=True,
+        eligible=True,
+        trigger_evidence=(make_evidence("trigger.md", 3, "trigger"),),
+        prevention_evidence=(make_evidence("outcome.md", 8, "outcome"),),
+        symptom_recurred=False,
+    )
+    result = verify_fix(
+        make_entry(
+            "fixture",
+            wired_check="fixture/SKILL.md",
+            artifact_ids=("skill:other",),
+        ),
+        symptom_evidence=make_evidence_set("symptom-absent"),
+        invocation_evidence=(),
+        outcome_evidence=(),
+        coverage_records=(record,),
+    )
+    assert result.invocation.status is CheckStatus.INSUFFICIENT
+    assert result.outcome.status is CheckStatus.INSUFFICIENT
+
+
 def test_failed_invocation_is_not_operating():
     result = verify_fix(
         make_entry("fixture"),

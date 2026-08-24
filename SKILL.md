@@ -1,7 +1,8 @@
 ---
 name: reflect-setup
 description: Diagnostic-only, dual-runtime scan of Claude Code or Codex session transcripts to find recurring friction and rank improvement candidates with cited evidence.
-argument-hint: [days-back] [project-filter]
+metadata:
+  argument-hint: "[days-back] [project-filter]"
 ---
 
 # Reflect on Setup

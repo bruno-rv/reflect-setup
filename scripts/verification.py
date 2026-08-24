@@ -163,9 +163,7 @@ def _cluster_key(value: str) -> str:
 def _target_ids(entry: LedgerEntry, explicit: Iterable[str]) -> frozenset[str]:
     target_values = (explicit,) if isinstance(explicit, str) else tuple(explicit)
     if not target_values:
-        if not isinstance(entry.wired_check, str) or not entry.wired_check.strip():
-            return frozenset()
-        target_values = (entry.wired_check.strip(),)
+        target_values = tuple(entry.artifact_ids)
     if any(not isinstance(value, str) or not value.strip() for value in target_values):
         raise ValueError("target_artifact_ids must contain non-empty strings")
     return frozenset(value.strip() for value in target_values)
@@ -245,6 +243,16 @@ def verify_fix(
         LedgerStatus.RESOLVED,
     } and (not isinstance(entry.wired_check, str) or not entry.wired_check.strip()):
         raise ValueError("applied entries require a non-empty wired_check")
+    if entry.status in {
+        LedgerStatus.FIX_APPLIED,
+        LedgerStatus.BUILT_NOT_OPERATING,
+        LedgerStatus.RESOLVED,
+    } and (
+        not isinstance(entry.artifact_ids, tuple)
+        or not entry.artifact_ids
+        or any(not isinstance(value, str) or not value.strip() for value in entry.artifact_ids)
+    ):
+        raise ValueError("applied entries require non-empty artifact_ids")
 
     symptom = list(_coerce_evidence(symptom_evidence, "symptom_evidence"))
     invocation = list(_coerce_evidence(invocation_evidence, "invocation_evidence"))

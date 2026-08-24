@@ -93,10 +93,16 @@ def make_verification(symptom, invocation, outcome):
     return FixVerification("fixture", checks[0], checks[1], checks[2], overall, recommended)
 
 
-def make_entry(cluster_id="fixture", status="fix-applied", wired_check="fixture evidence"):
+def make_entry(
+    cluster_id="fixture",
+    status="fix-applied",
+    wired_check="fixture evidence",
+    artifact_ids=None,
+):
     from ledger import LedgerEntry, LedgerStatus
 
-    return LedgerEntry(cluster_id, LedgerStatus(status), wired_check)
+    declared_artifacts = (wired_check,) if artifact_ids is None else tuple(artifact_ids)
+    return LedgerEntry(cluster_id, LedgerStatus(status), wired_check, declared_artifacts)
 
 
 def make_findings(occurrences, sessions, projects, dates, cluster_key="fixture"):

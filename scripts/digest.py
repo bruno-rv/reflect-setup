@@ -21,7 +21,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Mapping
 
-from runtime import Runtime, RuntimeSpec, Scope
+from runtime import Runtime, RuntimeSpec, Scope, discover_sessions
 
 
 USER_TRUNCATE = 500
@@ -340,28 +340,10 @@ def signals_from_event(
 
 
 def _candidate_paths(spec: RuntimeSpec, scope: Scope):
-    if not spec.source_root.is_dir():
-        return ()
-    try:
-        paths = sorted(spec.source_root.rglob("*.jsonl"))
-    except OSError:
-        return ()
-    candidates = []
-    for path in paths:
-        if not path.is_file():
-            continue
-        relative = path.relative_to(spec.source_root).as_posix()
-        if "memory" in Path(relative).parts:
-            continue
-        if not scope.include_subagents and "subagents" in Path(relative).parts:
-            continue
-        if spec.runtime is Runtime.CLAUDE:
-            parts = Path(relative).parts
-            project = parts[0] if len(parts) > 1 else ""
-            if scope.project_filter and scope.project_filter not in project:
-                continue
-        candidates.append((relative, path))
-    return tuple(candidates)
+    return tuple(
+        (session.relative_path, session.source_path)
+        for session in discover_sessions(spec, scope)
+    )
 
 
 def _codex_metadata(entry):

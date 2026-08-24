@@ -65,6 +65,15 @@ validated `CoverageRecord` values through `coverage_records` instead; the two
 forms are mutually exclusive. The core validates each artifact ID/type
 against the inventory and never invents `eligible=False`.
 
+## Ledger artifact mapping
+
+Operating ledger entries (`fix-applied`, `built-not-operating`, and `resolved`)
+must declare a non-empty `artifact_ids` list of stable runtime artifact IDs.
+Coverage verification matches only those IDs. `wired_check` remains a
+human-readable description of the independent operating check and is never
+interpreted as an artifact ID. Ledger updates that receive a `LedgerEntry`
+preserve and serialize its declared `artifact_ids`.
+
 ## Digest and manifest
 
 ```bash
@@ -128,8 +137,8 @@ Validated reports merge only true duplicates sharing normalized cluster,
 finding type, and session. Evidence identity remains `(digest_path, source_line)`
 and project identity is never inferred from filenames.
 
-For each touched ledger entry with a non-empty `wired_check`, evaluate three
-independent checks:
+For each touched operating ledger entry, evaluate three independent checks
+against its declared `artifact_ids` and human-readable `wired_check`:
 
 1. **Symptom** — explicit `symptom-absent` passes; current recurrence fails.
 2. **Invocation** — `invoked` proves the artifact was loaded/called.
