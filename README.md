@@ -72,6 +72,10 @@ repeated `--approve-cluster ID` flags, an explicit `--ledger PATH` when ledger
 verification is wanted, and host-supplied typed request/workspace inputs. A
 bare CLI approval fails closed; the host performs fixer execution and notes or
 ledger updates after Python validates previews and optional `FixProof` values.
+Operating ledger `artifact_ids` use namespaced IDs such as
+`claude:project:.claude/skills/fixture/SKILL.md` or
+`codex:global:.codex/skills/fixture/SKILL.md`; migrate older unqualified IDs
+explicitly because they are not treated as aliases.
 
 ## Host workflow
 

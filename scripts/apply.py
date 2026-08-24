@@ -38,6 +38,7 @@ class ApplyPreview:
     workspace_state: WorkspaceState
     disjoint_scope: bool
     expected_diff: tuple[Path, ...]
+    directory_targets: tuple[Path, ...] = ()
 
 
 @_frozen_dataclass
@@ -94,8 +95,17 @@ def _relative_path(path: Path, root: Path, *, label: str) -> Path:
         raise TypeError(f"{label} must contain pathlib.Path values")
     if path.is_absolute():
         raise ApplyScopeError(f"path {path} is outside the selected project scope")
+    candidate = root / path
+    current = root
+    for part in path.parts:
+        current = current / part
+        try:
+            if current.is_symlink():
+                raise ApplyScopeError(f"path {path} contains a symlink")
+        except OSError as exc:
+            raise ApplyScopeError(f"cannot inspect path {path}") from exc
     try:
-        resolved = (root / path).resolve(strict=False)
+        resolved = candidate.resolve(strict=False)
         relative = resolved.relative_to(root)
     except (OSError, ValueError) as exc:
         raise ApplyScopeError(f"path {path} is outside the selected project scope") from exc
@@ -168,11 +178,15 @@ def build_preview(
     dirty_paths = _paths(workspace.dirty_paths, root, label="dirty_paths")
     normalized_request = _validated_request(request, root)
     normalized_workspace = WorkspaceState(workspace.project_root, dirty_paths, workspace.conflicted)
+    directory_targets = tuple(
+        path for path in normalized_request.target_paths if (root / path).is_dir()
+    )
     return ApplyPreview(
         normalized_request,
         normalized_workspace,
         True,
         normalized_request.target_paths,
+        directory_targets,
     )
 
 
@@ -181,6 +195,21 @@ def _preview_paths(preview: ApplyPreview) -> tuple[Path, ...]:
         raise TypeError("preview must be an ApplyPreview")
     root = _root(preview.workspace_state)
     return _paths(preview.request.target_paths, root, label="preview target_paths")
+
+
+def _preview_directory_targets(preview: ApplyPreview) -> tuple[Path, ...]:
+    if not isinstance(preview, ApplyPreview):
+        raise TypeError("preview must be an ApplyPreview")
+    root = _root(preview.workspace_state)
+    directory_targets = _paths(
+        preview.directory_targets,
+        root,
+        label="preview directory_targets",
+    )
+    approved = set(_preview_paths(preview))
+    if not set(directory_targets).issubset(approved):
+        raise ApplyScopeError("preview directory target is not an approved target path")
+    return directory_targets
 
 
 def check_scope_overlap(first: ApplyPreview, second: ApplyPreview) -> tuple[str, str] | None:
@@ -270,8 +299,17 @@ def validate_proof(preview: ApplyPreview, proof: FixProof) -> None:
     changed_paths = _paths(proof.changed_paths, root, label="changed_paths")
     baseline = set(_paths(preview.workspace_state.dirty_paths, root, label="dirty_paths"))
     approved = set(_preview_paths(preview))
+    directory_targets = set(_preview_directory_targets(preview))
     new_paths = set(changed_paths) - baseline
-    outside = sorted(new_paths - approved, key=lambda path: path.as_posix())
+    outside = sorted(
+        (
+            path
+            for path in new_paths
+            if path not in approved
+            and not any(target in path.parents for target in directory_targets)
+        ),
+        key=lambda path: path.as_posix(),
+    )
     if outside:
         raise ApplyScopeError(f"changed path {outside[0]} is outside approved Apply scope")
 

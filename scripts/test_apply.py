@@ -1,7 +1,8 @@
 """Focused safety and proof checks for the opt-in Apply phase."""
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
-from apply import ApplyProofError, ApplyScopeError, build_preview, check_scope_overlap, validate_proof
+from apply import ApplyProofError, ApplyRequest, ApplyScopeError, FixProof, WorkspaceState, build_preview, check_scope_overlap, validate_proof
 from test_support import make_inventory, make_preview, make_proof, make_request, make_workspace
 
 
@@ -57,6 +58,70 @@ def test_proof_accepts_nonempty_fixer_output_without_status_marker():
         passed=True,
     )
     validate_proof(preview, proof)
+
+
+def test_proof_accepts_descendant_only_for_directory_target_established_at_preview():
+    with TemporaryDirectory() as raw:
+        root = Path(raw)
+        (root / "hooks").mkdir()
+        request = ApplyRequest("fixture", (Path("hooks"),), ("true",), ("true",))
+        preview = build_preview(
+            request,
+            inventory=make_inventory(),
+            workspace=WorkspaceState(root, (), False),
+        )
+        proof = FixProof(
+            "fixture",
+            (Path("hooks/retry.sh"),),
+            ("updated retry",),
+            ("true :: PASS",),
+            True,
+        )
+        validate_proof(preview, proof)
+
+
+def test_proof_rejects_file_target_siblings_and_descendants():
+    with TemporaryDirectory() as raw:
+        root = Path(raw)
+        (root / "SKILL.md").write_text("fixture")
+        request = ApplyRequest("fixture", (Path("SKILL.md"),), ("true",), ("true",))
+        preview = build_preview(
+            request,
+            inventory=make_inventory(),
+            workspace=WorkspaceState(root, (), False),
+        )
+        for changed in (Path("SKILL.md.bak"), Path("SKILL.md/child")):
+            proof = FixProof(
+                "fixture",
+                (changed,),
+                ("updated",),
+                ("true :: PASS",),
+                True,
+            )
+            try:
+                validate_proof(preview, proof)
+            except ApplyScopeError:
+                pass
+            else:
+                raise AssertionError("file target boundaries must reject sibling and descendant paths")
+
+
+def test_preview_rejects_symlinked_target_even_when_link_resolves_inside_root():
+    with TemporaryDirectory() as raw:
+        root = Path(raw)
+        (root / "real").mkdir()
+        (root / "link").symlink_to(root / "real", target_is_directory=True)
+        request = ApplyRequest("fixture", (Path("link"),), ("true",), ("true",))
+        try:
+            build_preview(
+                request,
+                inventory=make_inventory(),
+                workspace=WorkspaceState(root, (), False),
+            )
+        except ApplyScopeError as exc:
+            assert "symlink" in str(exc)
+        else:
+            raise AssertionError("symlinked Apply targets must fail closed")
 
 
 def test_proof_rejects_new_path_outside_scope():

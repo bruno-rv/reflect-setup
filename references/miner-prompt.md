@@ -85,7 +85,10 @@ Rules for the fields:
 - Each evidence reference names an assigned digest path, uses a positive
   digest `source_line`, and includes an RFC 3339 timestamp with timezone.
   Evidence is typed, has a positive `occurrence_count`, and must point to the
-  signal supporting that finding.
+  signal supporting that finding. Copy `source_line`, timestamp, kind, and
+  project exactly from the manifest evidence index; do not invent metadata.
+  Every cited index entry must belong to the finding's `session_id`, and a
+  finding must not mix sessions.
 - `themes` is an array of zero, one, or two short strings. Do not include more
   than two themes.
 - Use `findings: []` when the batch has no retained signals. Do not fabricate

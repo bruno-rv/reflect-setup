@@ -78,12 +78,111 @@ def test_report_accepts_strict_rfc3339_z_and_numeric_offset():
     manifest, batch = manifest_and_batch()
     for timestamp, expected in (
         ("2026-08-23T10:00:00Z", datetime(2026, 8, 23, 10, tzinfo=timezone.utc)),
-        ("2026-08-23T12:30:45+02:30", datetime(2026, 8, 23, 10, 0, 45, tzinfo=timezone.utc)),
+        ("2026-08-23T12:00:00+02:00", datetime(2026, 8, 23, 10, tzinfo=timezone.utc)),
     ):
         payload = valid_payload()
         payload["findings"][0]["evidence"][0]["timestamp"] = timestamp
         report = parse_report(json.dumps(payload), manifest, batch)
         assert report.findings[0].evidence[0].timestamp == expected
+
+
+def test_report_rejects_evidence_for_nonexistent_source_line():
+    manifest, batch = manifest_and_batch()
+    payload = valid_payload()
+    payload["findings"][0]["evidence"][0]["source_line"] = 999
+    try:
+        parse_report(json.dumps(payload), manifest, batch)
+    except ReportValidationError as exc:
+        assert "line" in str(exc) or "index" in str(exc)
+    else:
+        raise AssertionError("evidence must cite a retained source line")
+
+
+def test_report_rejects_evidence_with_wrong_index_timestamp():
+    manifest, batch = manifest_and_batch()
+    payload = valid_payload()
+    payload["findings"][0]["evidence"][0]["timestamp"] = "2026-08-23T11:00:00Z"
+    try:
+        parse_report(json.dumps(payload), manifest, batch)
+    except ReportValidationError as exc:
+        assert "timestamp" in str(exc) or "index" in str(exc)
+    else:
+        raise AssertionError("evidence timestamp must match the retained signal")
+
+
+def test_report_rejects_finding_session_not_backed_by_evidence():
+    manifest, batch = manifest_and_batch()
+    payload = valid_payload()
+    payload["findings"][0]["session_id"] = "invented-session"
+    try:
+        parse_report(json.dumps(payload), manifest, batch)
+    except ReportValidationError as exc:
+        assert "session" in str(exc)
+    else:
+        raise AssertionError("finding session must match cited digest metadata")
+
+
+def test_report_rejects_kind_not_supported_by_indexed_error_signal():
+    manifest = make_manifest(
+        run_id="run-1",
+        files=("error.md",),
+        lines=(("error.md", 1, "2026-08-23T10:00:00Z", "error"),),
+        project="project-a",
+    )
+    batch = make_batch("batch-1", ("error.md",))
+    payload = valid_payload()
+    payload["digest_paths"] = ["error.md"]
+    payload["findings"][0]["finding_type"] = "correction"
+    payload["findings"][0]["evidence"][0].update(
+        {
+            "digest_path": "error.md",
+            "project": "project-a",
+            "source_line": 1,
+            "kind": "correction",
+        }
+    )
+    try:
+        parse_report(json.dumps(payload), manifest, batch)
+    except ReportValidationError as exc:
+        assert "kind" in str(exc)
+    else:
+        raise AssertionError("indexed signal kind must constrain miner evidence")
+
+
+def test_report_rejects_mixed_sessions_under_one_finding():
+    manifest = make_manifest(
+        run_id="run-1",
+        files=("a.md", "b.md"),
+        projects=(("a.md", "project-a"), ("b.md", "project-b")),
+        sessions=(("a.md", "session-a"), ("b.md", "session-b")),
+    )
+    batch = make_batch("batch-1", ("a.md", "b.md"))
+    payload = valid_payload()
+    payload["digest_paths"] = ["a.md", "b.md"]
+    finding = payload["findings"][0]
+    finding["evidence"] = [
+        {
+            "digest_path": "a.md",
+            "project": "project-a",
+            "source_line": 1,
+            "timestamp": "2026-08-23T10:00:00Z",
+            "kind": "failure",
+        },
+        {
+            "digest_path": "b.md",
+            "project": "project-b",
+            "source_line": 1,
+            "timestamp": "2026-08-23T10:00:00Z",
+            "kind": "failure",
+        },
+    ]
+    finding["occurrence_count"] = 2
+    try:
+        parse_report(json.dumps(payload), manifest, batch)
+    except ReportValidationError as exc:
+        assert "session" in str(exc)
+    else:
+        raise AssertionError("a finding cannot cite mixed sessions")
 
 
 def test_report_rejects_rfc3339_near_misses():
@@ -232,6 +331,36 @@ def test_merge_rejects_typed_finding_without_evidence():
         raise AssertionError("typed findings without evidence must fail closed")
 
 
+def test_merge_rejects_typed_finding_with_invented_session_id():
+    manifest = make_manifest(run_id="run-1", files=("a.md",))
+    report = make_report("batch-1", "a.md")
+    finding = report.findings[0]
+    invented = Finding(
+        finding.cluster_key,
+        finding.finding_type,
+        "invented-session",
+        finding.paraphrase,
+        finding.occurrence_count,
+        finding.confidence,
+        finding.evidence,
+    )
+    report = MinerReport(
+        report.schema_version,
+        report.runtime,
+        report.run_id,
+        report.batch_id,
+        report.digest_paths,
+        (invented,),
+        report.themes,
+    )
+    try:
+        merge_reports((report,), manifest)
+    except ReportValidationError as exc:
+        assert "session" in str(exc)
+    else:
+        raise AssertionError("typed findings must bind session IDs to evidence")
+
+
 def test_merge_sums_distinct_evidence_and_sorts_clusters():
     manifest = make_manifest(run_id="run-1", files=("a.md", "b.md"))
     first = make_report("batch-1", "a.md")
@@ -250,7 +379,7 @@ def test_merge_rejects_aggregate_count_not_matching_explicit_evidence_counts():
         files=("a.md", "b.md"),
         projects=(("a.md", "project-a"), ("b.md", "project-a")),
     )
-    timestamp = datetime(2026, 8, 23, tzinfo=timezone.utc)
+    timestamp = datetime(2026, 8, 23, 10, tzinfo=timezone.utc)
     finding = Finding(
         "fixture", FindingType.FAILURE, "session-a", "first", 4, 0.8,
         (
@@ -273,7 +402,7 @@ def test_merge_counts_only_distinct_evidence_when_findings_partially_overlap():
         files=("a.md", "b.md"),
         projects=(("a.md", "project-a"), ("b.md", "project-a")),
     )
-    timestamp = datetime(2026, 8, 23, tzinfo=timezone.utc)
+    timestamp = datetime(2026, 8, 23, 10, tzinfo=timezone.utc)
     first = Finding(
         "fixture", FindingType.FAILURE, "session-a", "first", 3, 0.8,
         (
@@ -296,6 +425,12 @@ def test_merge_preserves_distinct_sessions_and_finding_types():
         run_id="run-1",
         files=("a.md", "b.md", "c.md"),
         projects=(("a.md", "project-a"), ("b.md", "project-b"), ("c.md", "project-c")),
+        sessions=(("a.md", "session-a"), ("b.md", "session-b"), ("c.md", "session-c")),
+        lines=(
+            ("a.md", 1, "2026-08-23T10:00:00Z", "failure"),
+            ("b.md", 1, "2026-08-23T10:00:00Z", "failure"),
+            ("c.md", 1, "2026-08-23T10:00:00Z", "complaint"),
+        ),
     )
     reports = []
     for batch_id, path, session_id, finding_type, project in (
@@ -306,7 +441,7 @@ def test_merge_preserves_distinct_sessions_and_finding_types():
         evidence = EvidenceRef(
             path,
             1,
-            datetime(2026, 8, 23, tzinfo=timezone.utc),
+            datetime(2026, 8, 23, 10, tzinfo=timezone.utc),
             finding_type,
             project,
         )

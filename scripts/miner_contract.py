@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Mapping
 
-from digest import DigestManifest
+from digest import DigestManifest, EvidenceIndexEntry, SignalKind
 from runtime import Runtime
 
 
@@ -177,8 +177,91 @@ def _manifest_projects(manifest: DigestManifest) -> dict[str, str]:
     return projects
 
 
+def _manifest_evidence_index(
+    manifest: DigestManifest,
+) -> dict[tuple[str, int], tuple[EvidenceIndexEntry, ...]]:
+    index: dict[tuple[str, int], list[EvidenceIndexEntry]] = {}
+    for source in manifest.source_files:
+        if source.digest_path is None:
+            if source.evidence_index:
+                _fail("manifest evidence index cannot reference a source without a digest")
+            continue
+        if not isinstance(source.evidence_index, (tuple, list)):
+            _fail(f"manifest evidence index must be a sequence for {source.digest_path}")
+        for entry in source.evidence_index:
+            if not isinstance(entry, EvidenceIndexEntry):
+                _fail(f"manifest evidence index entry is invalid for {source.digest_path}")
+            if (
+                isinstance(entry.source_line, bool)
+                or not isinstance(entry.source_line, int)
+                or entry.source_line <= 0
+            ):
+                _fail(f"manifest evidence index source_line is invalid for {source.digest_path}")
+            if not isinstance(entry.timestamp, datetime) or entry.timestamp.tzinfo is None:
+                _fail(f"manifest evidence index timestamp is invalid for {source.digest_path}")
+            if not isinstance(entry.kind, (SignalKind, FindingType)):
+                _fail(f"manifest evidence index kind is invalid for {source.digest_path}")
+            project = _non_empty_string(
+                entry.project,
+                f"manifest evidence index project for {source.digest_path}",
+            )
+            expected_project = _non_empty_string(
+                source.project,
+                f"manifest project for {source.digest_path}",
+            )
+            if project != expected_project:
+                _fail(f"manifest evidence index project does not match {source.digest_path}")
+            _non_empty_string(
+                entry.session_id,
+                f"manifest evidence index session_id for {source.digest_path}",
+            )
+            key = (source.digest_path, entry.source_line)
+            index.setdefault(key, []).append(entry)
+    return {key: tuple(values) for key, values in index.items()}
+
+
 def _evidence_key(ref: EvidenceRef) -> tuple[str, int]:
     return ref.digest_path, ref.source_line
+
+
+def _index_kind_matches(ref_kind: FindingType, index_kind: SignalKind | FindingType) -> bool:
+    if isinstance(index_kind, FindingType):
+        return ref_kind is index_kind
+    if index_kind is SignalKind.USER:
+        return True
+    if index_kind is SignalKind.ERROR:
+        return ref_kind is FindingType.FAILURE
+    if index_kind is SignalKind.INTERRUPT:
+        return ref_kind in {FindingType.FAILURE, FindingType.FRICTION}
+    return False
+
+
+def _matching_index_entries(
+    ref: EvidenceRef,
+    *,
+    manifest_index: Mapping[tuple[str, int], tuple[EvidenceIndexEntry, ...]],
+    label: str,
+) -> tuple[EvidenceIndexEntry, ...]:
+    entries = manifest_index.get(_evidence_key(ref), ())
+    if not entries:
+        _fail(f"{label} does not cite a retained source line")
+    timestamp = ref.timestamp.astimezone(UTC)
+    timestamp_entries = tuple(
+        entry for entry in entries if entry.timestamp.astimezone(UTC) == timestamp
+    )
+    if not timestamp_entries:
+        _fail(f"{label} timestamp does not match the retained signal")
+    project_entries = tuple(
+        entry for entry in timestamp_entries if entry.project == ref.project
+    )
+    if not project_entries:
+        _fail(f"{label} project does not match the retained signal")
+    kind_entries = tuple(
+        entry for entry in project_entries if _index_kind_matches(ref.kind, entry.kind)
+    )
+    if not kind_entries:
+        _fail(f"{label} kind does not match the retained signal")
+    return kind_entries
 
 
 def _normalize_cluster_key(value: str) -> str:
@@ -204,6 +287,7 @@ def _parse_evidence(
     finding_type: FindingType,
     manifest_paths: frozenset[str],
     manifest_projects: Mapping[str, str],
+    manifest_index: Mapping[tuple[str, int], tuple[EvidenceIndexEntry, ...]],
     batch_paths: frozenset[str],
     index: int,
 ) -> EvidenceRef:
@@ -248,7 +332,7 @@ def _parse_evidence(
         or occurrence_count <= 0
     ):
         _fail("evidence.occurrence_count must be a positive integer")
-    return EvidenceRef(
+    ref = EvidenceRef(
         digest_path=digest_path,
         source_line=source_line,
         timestamp=_timestamp(value["timestamp"], "evidence.timestamp"),
@@ -256,6 +340,12 @@ def _parse_evidence(
         project=project,
         occurrence_count=occurrence_count,
     )
+    _matching_index_entries(
+        ref,
+        manifest_index=manifest_index,
+        label=f"findings[].evidence[{index}]",
+    )
+    return ref
 
 
 def _parse_finding(
@@ -263,6 +353,7 @@ def _parse_finding(
     *,
     manifest_paths: frozenset[str],
     manifest_projects: Mapping[str, str],
+    manifest_index: Mapping[tuple[str, int], tuple[EvidenceIndexEntry, ...]],
     batch_paths: frozenset[str],
     index: int,
 ) -> Finding:
@@ -301,6 +392,7 @@ def _parse_finding(
             finding_type=finding_type,
             manifest_paths=manifest_paths,
             manifest_projects=manifest_projects,
+            manifest_index=manifest_index,
             batch_paths=batch_paths,
             index=evidence_index,
         )
@@ -316,6 +408,17 @@ def _parse_finding(
         _fail(
             "finding.occurrence_count must equal the sum of distinct evidence occurrence_count values"
         )
+    cited_sessions = {
+        entry.session_id
+        for ref in evidence
+        for entry in _matching_index_entries(
+            ref,
+            manifest_index=manifest_index,
+            label="finding evidence",
+        )
+    }
+    if cited_sessions != {session_id}:
+        _fail("finding.session_id must match every cited digest session")
     return Finding(
         cluster_key=cluster_key,
         finding_type=finding_type,
@@ -362,6 +465,7 @@ def parse_report(raw: str, manifest: DigestManifest, batch: BatchSpec) -> MinerR
         _fail("assigned batch paths must not contain duplicates")
     manifest_paths = _manifest_paths(manifest)
     manifest_projects = _manifest_projects(manifest)
+    manifest_index = _manifest_evidence_index(manifest)
     batch_path_set = frozenset(assigned_paths)
     if not batch_path_set.issubset(manifest_paths):
         missing = sorted(batch_path_set - manifest_paths)
@@ -374,6 +478,7 @@ def parse_report(raw: str, manifest: DigestManifest, batch: BatchSpec) -> MinerR
             finding,
             manifest_paths=manifest_paths,
             manifest_projects=manifest_projects,
+            manifest_index=manifest_index,
             batch_paths=batch_path_set,
             index=index,
         )
@@ -389,6 +494,7 @@ def _validate_typed_finding(
     report_paths: tuple[str, ...],
     manifest_paths: frozenset[str],
     manifest_projects: Mapping[str, str],
+    manifest_index: Mapping[tuple[str, int], tuple[EvidenceIndexEntry, ...]],
     label: str,
 ) -> None:
     if not isinstance(finding.finding_type, FindingType):
@@ -435,6 +541,11 @@ def _validate_typed_finding(
             or ref.occurrence_count <= 0
         ):
             _fail(f"{evidence_label}.occurrence_count must be a positive integer")
+        _matching_index_entries(
+            ref,
+            manifest_index=manifest_index,
+            label=evidence_label,
+        )
         key = _evidence_key(ref)
         if key in seen:
             if seen_counts[key] != ref.occurrence_count:
@@ -453,6 +564,17 @@ def _validate_typed_finding(
         _fail(
             f"{label}.occurrence_count must equal the sum of distinct evidence occurrence_count values"
         )
+    cited_sessions = {
+        entry.session_id
+        for ref in finding.evidence
+        for entry in _matching_index_entries(
+            ref,
+            manifest_index=manifest_index,
+            label=f"{label}.evidence",
+        )
+    }
+    if cited_sessions != {finding.session_id}:
+        _fail(f"{label}.session_id must match every cited digest session")
 
 
 def _typed_report_paths(report: MinerReport, manifest: DigestManifest) -> tuple[str, ...]:
@@ -478,6 +600,7 @@ def _typed_report_paths(report: MinerReport, manifest: DigestManifest) -> tuple[
         _fail(f"report {report.batch_id!r} has duplicate digest paths")
     manifest_paths = _manifest_paths(manifest)
     manifest_projects = _manifest_projects(manifest)
+    manifest_index = _manifest_evidence_index(manifest)
     unknown = sorted(set(paths) - manifest_paths)
     if unknown:
         _fail(f"report digest path is missing from manifest: {', '.join(unknown)}")
@@ -491,6 +614,7 @@ def _typed_report_paths(report: MinerReport, manifest: DigestManifest) -> tuple[
             report_paths=paths,
             manifest_paths=manifest_paths,
             manifest_projects=manifest_projects,
+            manifest_index=manifest_index,
             label=f"report finding {finding_index}",
         )
     return paths

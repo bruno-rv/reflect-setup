@@ -32,7 +32,14 @@ from coverage_model import (
     InventoryItem,
     assess_coverage,
 )
-from digest import DigestManifest, IncompleteDigestError, run_digest
+from digest import (
+    DigestManifest,
+    EvidenceIndexEntry,
+    IncompleteDigestError,
+    SignalKind,
+    run_digest,
+    _scan_typed_source,
+)
 from ledger import LedgerStatus, parse_ledger
 from miner_contract import (
     BatchSpec,
@@ -229,6 +236,24 @@ def _validate_continuation_manifest(
             raise ReportValidationError(
                 f"continuation source hash changed: {source.source_path}"
             )
+        expected_source, unused_signals, unused_complete, unused_project_match = _scan_typed_source(
+            spec,
+            manifest.scope,
+            source.source_path,
+            current_path,
+        )
+        if expected_source.project != source.project:
+            raise ReportValidationError(
+                f"continuation source project changed: {source.source_path}"
+            )
+        if expected_source.thread_source != source.thread_source:
+            raise ReportValidationError(
+                f"continuation source thread metadata changed: {source.source_path}"
+            )
+        if expected_source.evidence_index != source.evidence_index:
+            raise ReportValidationError(
+                f"continuation evidence index changed: {source.source_path}"
+            )
         if source.digest_path is None:
             continue
         digest_path = _continuation_path(source.digest_path, out_dir)
@@ -287,22 +312,90 @@ def _load_manifest(out_dir: Path) -> DigestManifest | None:
         raw_source_files = value["source_files"]
         if not isinstance(raw_source_files, list):
             raise ReportValidationError("continuation manifest source_files must be an array")
-        source_files = tuple(
-            SourceFile(
-                source_path=item["source_path"],
-                sha256=item["sha256"],
-                scanned=bool(item["scanned"]),
-                readable=bool(item["readable"]),
-                json_lines=int(item["json_lines"]),
-                malformed_lines=int(item["malformed_lines"]),
-                untimestamped_lines=int(item["untimestamped_lines"]),
-                in_scope_events=int(item["in_scope_events"]),
-                project=item.get("project", ""),
-                digest_path=item.get("digest_path"),
-                thread_source=item.get("thread_source"),
+        source_values = []
+        for item in raw_source_files:
+            raw_index = item["evidence_index"]
+            if not isinstance(raw_index, list):
+                raise ReportValidationError(
+                    "continuation manifest evidence_index must be an array"
+                )
+            evidence_index = []
+            for entry in raw_index:
+                if not isinstance(entry, dict):
+                    raise ReportValidationError(
+                        "continuation manifest evidence index entries must be objects"
+                    )
+                if set(entry) != {
+                    "source_line",
+                    "timestamp",
+                    "kind",
+                    "project",
+                    "session_id",
+                }:
+                    raise ReportValidationError(
+                        "continuation manifest evidence index entry fields are invalid"
+                    )
+                source_line = entry["source_line"]
+                if isinstance(source_line, bool) or not isinstance(source_line, int) or source_line <= 0:
+                    raise ReportValidationError(
+                        "continuation manifest evidence index source_line is invalid"
+                    )
+                timestamp = entry["timestamp"]
+                if not isinstance(timestamp, str) or not timestamp:
+                    raise ReportValidationError(
+                        "continuation manifest evidence index timestamp is invalid"
+                    )
+                raw_project = entry["project"]
+                raw_session_id = entry["session_id"]
+                if (
+                    not isinstance(raw_project, str)
+                    or not raw_project.strip()
+                    or not isinstance(raw_session_id, str)
+                    or not raw_session_id.strip()
+                ):
+                    raise ReportValidationError(
+                        "continuation manifest evidence index identity is invalid"
+                    )
+                if timestamp.endswith("Z"):
+                    timestamp = timestamp[:-1] + "+00:00"
+                try:
+                    parsed_timestamp = _utc(datetime.fromisoformat(timestamp))
+                    kind = SignalKind(entry["kind"])
+                except (TypeError, ValueError) as exc:
+                    raise ReportValidationError(
+                        "continuation manifest evidence index entry is invalid"
+                    ) from exc
+                canonical_timestamp = parsed_timestamp.isoformat().replace("+00:00", "Z")
+                if entry["timestamp"] != canonical_timestamp:
+                    raise ReportValidationError(
+                        "continuation manifest evidence index timestamp is not canonical"
+                    )
+                evidence_index.append(
+                    EvidenceIndexEntry(
+                        source_line=source_line,
+                        timestamp=parsed_timestamp,
+                        kind=kind,
+                        project=raw_project,
+                        session_id=raw_session_id,
+                    )
+                )
+            source_values.append(
+                SourceFile(
+                    source_path=item["source_path"],
+                    sha256=item["sha256"],
+                    scanned=bool(item["scanned"]),
+                    readable=bool(item["readable"]),
+                    json_lines=int(item["json_lines"]),
+                    malformed_lines=int(item["malformed_lines"]),
+                    untimestamped_lines=int(item["untimestamped_lines"]),
+                    in_scope_events=int(item["in_scope_events"]),
+                    project=item.get("project", ""),
+                    digest_path=item.get("digest_path"),
+                    thread_source=item.get("thread_source"),
+                    evidence_index=tuple(evidence_index),
+                )
             )
-            for item in raw_source_files
-        )
+        source_files = tuple(source_values)
         manifest = DigestManifest(
             schema_version=int(value["schema_version"]),
             run_id=value["run_id"],
@@ -351,27 +444,41 @@ def _inventory(spec: RuntimeSpec) -> Inventory:
         except OSError:
             return ()
 
+    def root_namespace(configured_root: Path, root: Path) -> tuple[str, str]:
+        if configured_root.is_absolute():
+            origin = "global"
+            try:
+                identity = root.relative_to(spec.home.expanduser().resolve(strict=False)).as_posix()
+            except ValueError:
+                identity = root.as_posix()
+        else:
+            origin = "project"
+            identity = configured_root.as_posix()
+        return origin, identity
+
     for configured_root in spec.inventory_roots:
         root = configured_root if configured_root.is_absolute() else Path.cwd() / configured_root
-        root = root.expanduser()
+        root = root.expanduser().resolve(strict=False)
         if root in seen_roots:
             continue
         seen_roots.add(root)
         candidates = inventory_paths(root)
+        origin, root_identity = root_namespace(configured_root, root)
         for path in candidates:
             if path == root:
-                artifact_id = path.as_posix()
+                artifact_id = f"{spec.runtime.value}:{origin}:{root_identity}"
                 kind = path.name
             else:
                 try:
                     relative = path.relative_to(root).as_posix()
                 except ValueError:
                     relative = path.name
-                artifact_id = relative
+                artifact_id = f"{spec.runtime.value}:{origin}:{root_identity}/{relative}"
                 kind = root.name or "artifact"
-            if path in seen_paths:
+            resolved_path = path.resolve(strict=False)
+            if resolved_path in seen_paths:
                 continue
-            seen_paths.add(path)
+            seen_paths.add(resolved_path)
             items.append(InventoryItem(artifact_id, kind, path, True))
     items.sort(key=lambda item: (item.artifact_id, item.artifact_kind, item.path.as_posix()))
     return Inventory(tuple(items))
@@ -395,6 +502,19 @@ def _coverage(
         raise ReportValidationError(
             "provide coverage_observations or coverage_records, not both"
         )
+    inventory_by_key: dict[tuple[str, str], InventoryItem] = {}
+    inventory_ids: set[str] = set()
+    for item in inventory.items:
+        if not isinstance(item, InventoryItem):
+            raise ReportValidationError("inventory items must be InventoryItem values")
+        key = (item.artifact_id, item.artifact_kind)
+        if item.artifact_id in inventory_ids:
+            raise ReportValidationError(
+                "inventory contains duplicate artifact id: "
+                f"{item.artifact_id}"
+            )
+        inventory_ids.add(item.artifact_id)
+        inventory_by_key[key] = item
     if observations is None and supplied_records is None:
         return ()
     if supplied_records is not None:
@@ -415,10 +535,7 @@ def _coverage(
             records = tuple(raw_records)
         else:
             records = tuple(supplied_records)
-        inventory_by_key = {
-            (item.artifact_id, item.artifact_kind): item for item in inventory.items
-        }
-        seen: set[tuple[str, str]] = set()
+        seen: set[str] = set()
         validated: list[CoverageRecord] = []
         for record in records:
             if not isinstance(record, CoverageRecord):
@@ -434,9 +551,9 @@ def _coverage(
                 raise ReportValidationError(
                     f"coverage record declaration does not match inventory for {record.artifact_id}"
                 )
-            if key in seen:
+            if record.artifact_id in seen:
                 raise ReportValidationError(
-                    f"duplicate coverage record for {record.artifact_id} ({record.artifact_kind})"
+                    f"duplicate coverage record for {record.artifact_id}"
                 )
             if not isinstance(record.eligible, bool) or not isinstance(record.triggered, bool):
                 raise ReportValidationError("coverage record states must be booleans")
@@ -445,7 +562,7 @@ def _coverage(
             evidence = tuple(record.evidence) + tuple(record.trigger_evidence) + tuple(record.prevention_evidence)
             if any(not isinstance(ref, EvidenceRef) for ref in evidence):
                 raise ReportValidationError("coverage record evidence must contain EvidenceRef values")
-            seen.add(key)
+            seen.add(record.artifact_id)
             validated.append(record)
         return tuple(validated)
     if isinstance(observations, Mapping):
@@ -465,18 +582,7 @@ def _coverage(
         raw_values = tuple(raw_values)
     else:
         raw_values = tuple(observations)
-    inventory_by_key: dict[tuple[str, str], InventoryItem] = {}
-    for item in inventory.items:
-        if not isinstance(item, InventoryItem):
-            raise ReportValidationError("inventory items must be InventoryItem values")
-        key = (item.artifact_id, item.artifact_kind)
-        if key in inventory_by_key:
-            raise ReportValidationError(
-                "inventory contains duplicate artifact id/type: "
-                f"{item.artifact_id} ({item.artifact_kind})"
-            )
-        inventory_by_key[key] = item
-    seen: set[tuple[str, str]] = set()
+    seen: set[str] = set()
     records: list[CoverageRecord] = []
     for observation in raw_values:
         if not isinstance(observation, CoverageObservation):
@@ -490,12 +596,12 @@ def _coverage(
                 "coverage observation references unknown artifact id/type: "
                 f"{observation.artifact_id} ({observation.artifact_kind})"
             )
-        if key in seen:
+        if observation.artifact_id in seen:
             raise ReportValidationError(
                 "duplicate coverage observation for "
-                f"{observation.artifact_id} ({observation.artifact_kind})"
+                f"{observation.artifact_id}"
             )
-        seen.add(key)
+        seen.add(observation.artifact_id)
         records.append(assess_coverage(observation=observation, exists=item.declared))
     return tuple(records)
 
@@ -887,7 +993,7 @@ def run_reflection(
         for item in verification
         if item.overall.value == "fail"
     }
-    ranked = _rank(findings, manifest.sessions_scanned, regression_counts)
+    ranked = _rank(findings, len(_manifest_session_paths(manifest)), regression_counts)
 
     previews: list[ApplyPreview] = []
     validated_proofs: list[str] = []

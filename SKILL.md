@@ -34,9 +34,10 @@ exist. The detailed operator contract is in `REFERENCE.md`.
 4. **Mine** — partition non-empty digest paths into disjoint batches and dispatch
    one host miner per batch using `references/miner-prompt.md`. Miners return
    JSON only; resume the run with `--miner-report` paths. [Detail](REFERENCE.md#miner-contract-and-batches)
-5. **Cluster** — validate every report against the manifest, require exact
-   batch coverage, and merge findings by cause while preserving session,
-   finding type, project, and evidence identity. [Detail](REFERENCE.md#clustering-and-verification)
+5. **Cluster** — validate every report against the manifest evidence index,
+   require exact batch coverage, and merge findings by cause while preserving
+   session, finding type, project, and evidence identity. A finding cannot cite
+   invented metadata or mix sessions. [Detail](REFERENCE.md#clustering-and-verification)
 6. **Verify wiring** — evaluate symptom, invocation, and independent behavioral
    outcome checks for touched ledger entries. Missing evidence never resolves a
    fix; recurrence produces `built-not-operating`. [Detail](REFERENCE.md#clustering-and-verification)
@@ -71,6 +72,8 @@ core never guesses or invokes a Claude/Codex task tool.
 - Runtime selection is explicit when auto-detection is ambiguous.
 - Event timestamps, not filesystem mtimes, determine scope.
 - A partial manifest or incomplete batch cannot be reported as complete.
+- Operating ledger `artifact_ids` use runtime/root-namespaced inventory IDs;
+  legacy unqualified IDs are not aliases.
 - Python writes only the local manifest, scratch digests, and report. The host
   owns notes/ledger updates; Apply is never implicit.
 - No privacy, redaction, or retention behavior is added by this skill.

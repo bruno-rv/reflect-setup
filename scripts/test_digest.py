@@ -150,6 +150,38 @@ def test_event_timestamp_controls_scope_even_when_mtime_is_stale():
         assert manifest.signal_counts["user"] == 1
 
 
+def test_manifest_indexes_each_retained_signal_with_source_truth():
+    with TemporaryDirectory() as raw:
+        root = Path(raw)
+        source_root = root / "projects" / "project-a"
+        source_root.mkdir(parents=True)
+        (source_root / "session.jsonl").write_text(
+            '{"type":"user","timestamp":"2026-08-23T10:00:00Z",'
+            '"message":{"role":"user","content":"recent event"}}\n'
+        )
+        spec = resolve_runtime("claude", home=root, env={}, source_root=source_root.parent)
+        scope = Scope(datetime(2026, 8, 23, 0, 0, tzinfo=timezone.utc), None, False)
+        manifest = run_digest(spec, scope, root / "out")
+        source = manifest.source_files[0]
+        assert len(source.evidence_index) == 1
+        entry = source.evidence_index[0]
+        assert entry.source_line == 1
+        assert entry.timestamp == datetime(2026, 8, 23, 10, tzinfo=timezone.utc)
+        assert entry.kind.value == "user"
+        assert entry.project == "project-a"
+        assert entry.session_id == "session"
+        persisted = json.loads((root / "out" / "manifest.json").read_text())
+        assert persisted["source_files"][0]["evidence_index"] == [
+            {
+                "source_line": 1,
+                "timestamp": "2026-08-23T10:00:00Z",
+                "kind": "user",
+                "project": "project-a",
+                "session_id": "session",
+            }
+        ]
+
+
 def test_old_event_is_excluded_from_recent_file_and_output_is_collision_free():
     with TemporaryDirectory() as raw:
         root = Path(raw)

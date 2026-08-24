@@ -1,14 +1,51 @@
 """Deterministic typed fixtures shared by the reflection test modules."""
 from datetime import datetime, timezone
 from pathlib import Path
+import re
 
 
-def make_manifest(run_id="run-1", files=("a.md",), lines=(), project="fixture-project", projects=()):
-    from digest import DigestManifest, SourceFile
+def make_manifest(
+    run_id="run-1",
+    files=("a.md",),
+    lines=(),
+    project="fixture-project",
+    projects=(),
+    sessions=(),
+):
+    from digest import DigestManifest, EvidenceIndexEntry, SignalKind, SourceFile
+    from miner_contract import FindingType
     from runtime import Runtime, Scope
 
     line_map = {path: count for path, count, unused_timestamp, unused_kind in lines}
+    line_metadata = {path: (count, timestamp, kind) for path, count, timestamp, kind in lines}
     project_map = dict(projects)
+    session_map = dict(sessions)
+
+    def session_for(path):
+        match = re.search(r"(session-[A-Za-z0-9]+)", Path(path).stem)
+        return session_map.get(path, match.group(1) if match else "session-a")
+
+    def index_kind(raw_kind):
+        try:
+            return SignalKind(raw_kind)
+        except ValueError:
+            return FindingType(raw_kind)
+
+    def index_for(path):
+        line, timestamp, kind = line_metadata.get(
+            path,
+            (line_map.get(path, 1), "2026-08-23T10:00:00Z", "failure"),
+        )
+        return (
+            EvidenceIndexEntry(
+                source_line=line,
+                timestamp=datetime.fromisoformat(timestamp.replace("Z", "+00:00")),
+                kind=index_kind(kind),
+                project=project_map.get(path, project),
+                session_id=session_for(path),
+            ),
+        )
+
     records = tuple(
         SourceFile(
             source_path=path,
@@ -21,6 +58,7 @@ def make_manifest(run_id="run-1", files=("a.md",), lines=(), project="fixture-pr
             in_scope_events=line_map.get(path, 1),
             digest_path=path,
             project=project_map.get(path, project),
+            evidence_index=index_for(path),
         )
         for path in files
     )
@@ -46,14 +84,15 @@ def make_batch(batch_id, paths):
 def make_report(batch_id, path, run_id="run-1", project="fixture-project"):
     from miner_contract import EvidenceRef, Finding, FindingType, MinerReport
 
+    session_id = "session-a"
     finding = Finding(
         cluster_key="fixture",
         finding_type=FindingType.FAILURE,
-        session_id="session-a",
+        session_id=session_id,
         paraphrase="fixture failure",
         occurrence_count=1,
         confidence=0.5,
-        evidence=(EvidenceRef(path, 1, datetime(2026, 8, 23, tzinfo=timezone.utc), FindingType.FAILURE, project),),
+        evidence=(EvidenceRef(path, 1, datetime(2026, 8, 23, 10, tzinfo=timezone.utc), FindingType.FAILURE, project),),
     )
     return MinerReport(1, "claude", run_id, batch_id, (path,), (finding,), ())
 

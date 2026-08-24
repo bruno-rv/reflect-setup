@@ -37,7 +37,12 @@ resulting recorded identity.
 
 ## Inventory and coverage
 
-Inventory records `InventoryItem` declarations from runtime-specific roots.
+Inventory records `InventoryItem` declarations from runtime-specific roots. Every
+artifact ID is namespaced as
+`<runtime>:<global|project>:<stable-root-identity>/<relative-path>` (a root file
+omits the final slash). This keeps global/project and Claude/Codex artifacts
+distinct. Existing ledgers must migrate their `artifact_ids` to these IDs; no
+compatibility alias is accepted because ambiguous coverage must fail closed.
 Each `CoverageRecord` keeps these states independent:
 
 - `declared`: an artifact exists in an inventory location;
@@ -56,7 +61,7 @@ run_reflection(
     ...,
     coverage_observations=(
         CoverageObservation(
-            artifact_id="fixture/SKILL.md",
+            artifact_id="claude:project:.claude/skills/fixture/SKILL.md",
             artifact_kind="skills",
             eligible=True,
             trigger_evidence=invocation_refs,
@@ -132,6 +137,12 @@ matching `kind`, explicit `project` identity, and a positive
 `occurrence_count`. The finding count must equal the sum of distinct evidence
 counts; overlapping reports count each evidence key once.
 
+The manifest also stores an evidence index for every retained signal. The path,
+source line, timestamp, kind, and project in a miner reference must match that
+index exactly, and `finding.session_id` must equal the session ID for every
+cited entry. Nonexistent lines, invented metadata, and mixed-session findings
+fail closed.
+
 The report's ordered `digest_paths` must equal its assigned `BatchSpec`. Across
 all reports, each non-empty manifest digest path must occur in exactly one
 batch. Unknown, overlapping, missing, malformed, or out-of-batch evidence
@@ -142,7 +153,8 @@ an empty report set.
 
 Validated reports merge only true duplicates sharing normalized cluster,
 finding type, and session. Evidence identity remains `(digest_path, source_line)`
-and project identity is never inferred from filenames.
+for aggregation, while its timestamp/kind/project/session metadata is bound to
+the manifest evidence index; project identity is never inferred from filenames.
 
 For each touched operating ledger entry, evaluate three independent checks
 against its declared `artifact_ids` and human-readable `wired_check`:
@@ -198,9 +210,11 @@ verification is wanted; no implicit current-directory ledger is read.
 Apply is opt-in and per cluster. `--apply` without repeated
 `--approve-cluster ID` flags fails before fixer work. The host displays a
 preview containing the project-relative target paths, dirty baseline, commands,
-and verification commands. `scripts/apply.py` rejects path escapes, unresolved
-workspace conflicts, overlapping parallel scopes, duplicate commands, and
-unapproved new paths.
+and verification commands. `scripts/apply.py` rejects path escapes, symlink
+traversal, unresolved workspace conflicts, overlapping parallel scopes,
+duplicate commands, and unapproved new paths. A changed descendant is accepted
+only when its approved target was an existing directory when the preview was
+built; file targets remain exact.
 
 The API requires typed host inputs for every approved ID:
 

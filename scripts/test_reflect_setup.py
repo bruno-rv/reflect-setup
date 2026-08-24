@@ -8,9 +8,10 @@ from tempfile import TemporaryDirectory
 
 from digest import IncompleteDigestError
 from apply import ApplyRequest, FixProof, WorkspaceState
-from coverage_model import CoverageObservation, assess_coverage
+from coverage_model import CoverageObservation, CoverageRecord, Inventory, InventoryItem, assess_coverage
 from miner_contract import EvidenceRef, FindingType, ReportValidationError
-from reflect_setup import ApplyApprovalError, run_reflection
+from reflect_setup import ApplyApprovalError, _coverage, _inventory, run_reflection
+from runtime import Runtime, RuntimeSpec
 
 
 def run_cli(*args):
@@ -47,6 +48,174 @@ def test_run_reflection_produces_manifest_report_and_ranked_candidates():
         assert result.report_path == root / "run" / "reflection-report.json"
         assert result.ranked_candidates == ()
         assert result.apply_preview is None
+
+
+def test_inventory_ids_namespace_runtime_and_global_project_root_origin():
+    with TemporaryDirectory() as raw:
+        root = Path(raw)
+        global_skill = root / ".codex" / "skills" / "fixture" / "SKILL.md"
+        project_skill = root / "project" / ".codex" / "skills" / "fixture" / "SKILL.md"
+        global_skill.parent.mkdir(parents=True)
+        project_skill.parent.mkdir(parents=True)
+        global_skill.write_text("global")
+        project_skill.write_text("project")
+        spec = RuntimeSpec(
+            Runtime.CODEX,
+            root,
+            root / "sessions",
+            root / ".codex" / "skills" / "reflect-setup",
+            (root / ".codex" / "skills", Path("project/.codex/skills")),
+        )
+        old_cwd = Path.cwd()
+        os.chdir(root)
+        try:
+            inventory = _inventory(spec)
+        finally:
+            os.chdir(old_cwd)
+        ids = {item.artifact_id for item in inventory.items}
+        assert "codex:global:.codex/skills/fixture/SKILL.md" in ids
+        assert "codex:project:project/.codex/skills/fixture/SKILL.md" in ids
+
+
+def test_inventory_ids_include_claude_runtime_namespace():
+    with TemporaryDirectory() as raw:
+        root = Path(raw)
+        global_skill = root / ".claude" / "skills" / "fixture" / "SKILL.md"
+        global_skill.parent.mkdir(parents=True)
+        global_skill.write_text("global")
+        spec = RuntimeSpec(
+            Runtime.CLAUDE,
+            root,
+            root / "projects",
+            root / ".claude" / "skills" / "reflect-setup",
+            (root / ".claude" / "skills",),
+        )
+        inventory = _inventory(spec)
+        assert {
+            item.artifact_id for item in inventory.items
+        } == {"claude:global:.claude/skills/fixture/SKILL.md"}
+
+
+def test_coverage_rejects_duplicate_inventory_before_lookup_overwrite():
+    inventory = Inventory(
+        (
+            InventoryItem("codex:global:skills:fixture", "skills", Path("one"), True),
+            InventoryItem("codex:global:skills:fixture", "skills", Path("two"), True),
+        )
+    )
+    record = CoverageRecord(
+        artifact_id="codex:global:skills:fixture",
+        artifact_kind="skills",
+        declared=True,
+        eligible=False,
+        triggered=False,
+        prevented=None,
+        evidence=(),
+        detail="fixture",
+    )
+    try:
+        _coverage(inventory, None, (record,))
+    except ReportValidationError as exc:
+        assert "duplicate" in str(exc)
+    else:
+        raise AssertionError("duplicate inventory identities must fail closed")
+
+
+def test_coverage_rejects_duplicate_supplied_records():
+    record = CoverageRecord(
+        artifact_id="codex:global:skills:fixture",
+        artifact_kind="skills",
+        declared=True,
+        eligible=False,
+        triggered=False,
+        prevented=None,
+        evidence=(),
+        detail="fixture",
+    )
+    inventory = Inventory((InventoryItem(record.artifact_id, record.artifact_kind, Path("one"), True),))
+    try:
+        _coverage(inventory, None, (record, record))
+    except ReportValidationError as exc:
+        assert "duplicate coverage record" in str(exc)
+    else:
+        raise AssertionError("duplicate supplied coverage records must fail closed")
+
+
+def test_ranking_denominator_uses_canonical_project_selected_manifest_sessions():
+    for project_filter, include_subagents, extra_path, extra_project in (
+        (None, False, "project-a/subagents/agent.jsonl", "project-a"),
+        ("project-a", False, "project-b/session-b.jsonl", "project-b"),
+    ):
+        with TemporaryDirectory() as raw:
+            root = Path(raw)
+            source_root = root / "projects"
+            canonical = source_root / "project-a" / "session-a.jsonl"
+            canonical.parent.mkdir(parents=True)
+            canonical.write_text(
+                '{"type":"user","timestamp":"2026-08-23T10:00:00Z",'
+                '"message":{"role":"user","content":"please fix this"}}\n'
+            )
+            extra = source_root / extra_path
+            extra.parent.mkdir(parents=True)
+            extra.write_text(
+                '{"type":"user","timestamp":"2026-08-23T10:00:00Z",'
+                '"message":{"role":"user","content":"another signal"}}\n'
+            )
+            kwargs = dict(
+                runtime_name="claude",
+                home=root,
+                source_root=source_root,
+                since=datetime(2026, 8, 23, tzinfo=timezone.utc),
+                project_filter=project_filter,
+                include_subagents=include_subagents,
+                out_dir=root / "run",
+                apply=False,
+            )
+            try:
+                run_reflection(miner_report_paths=(), **kwargs)
+            except ReportValidationError:
+                pass
+            manifest = json.loads((root / "run" / "manifest.json").read_text())
+            selected = [
+                item for item in manifest["source_files"] if item["digest_path"] is not None
+            ]
+            assert len(selected) == 1
+            item = selected[0]
+            entry = item["evidence_index"][0]
+            report = root / "miner-report.json"
+            report.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "runtime": "claude",
+                        "run_id": manifest["run_id"],
+                        "batch_id": "batch-a",
+                        "digest_paths": [item["digest_path"]],
+                        "findings": [
+                            {
+                                "cluster_key": "repeat-fix",
+                                "finding_type": "failure",
+                                "session_id": entry["session_id"],
+                                "paraphrase": "the same fix is requested",
+                                "occurrence_count": 1,
+                                "confidence": 0.9,
+                                "evidence": [
+                                    {
+                                        "digest_path": item["digest_path"],
+                                        "source_line": entry["source_line"],
+                                        "timestamp": entry["timestamp"],
+                                        "kind": "failure",
+                                        "project": entry["project"],
+                                    }
+                                ],
+                            }
+                        ],
+                        "themes": [],
+                    }
+                )
+            )
+            result = run_reflection(miner_report_paths=(report,), **kwargs)
+            assert result.ranked_candidates[0].metrics.analyzed_sessions == 1
 
 
 def test_cli_rejects_apply_without_explicit_cluster_approval():
@@ -467,6 +636,28 @@ def test_continuation_rejects_tampered_scope_metadata():
             raise AssertionError("tampered scope metadata must invalidate continuation")
 
 
+def test_continuation_rejects_tampered_evidence_index_metadata():
+    with TemporaryDirectory() as raw:
+        root = Path(raw)
+        kwargs, report, _ = _prepare_ranked_continuation(root)
+        manifest_path = root / "run" / "manifest.json"
+        value = json.loads(manifest_path.read_text())
+        value["source_files"][0]["evidence_index"][0]["timestamp"] = (
+            "2026-08-23T11:00:00Z"
+        )
+        manifest_path.write_text(json.dumps(value))
+        try:
+            run_reflection(
+                miner_report_paths=(report,),
+                apply=False,
+                **{key: value for key, value in kwargs.items() if key != "apply"},
+            )
+        except ReportValidationError as exc:
+            assert "evidence index" in str(exc)
+        else:
+            raise AssertionError("tampered evidence index must invalidate continuation")
+
+
 def test_ledger_is_only_read_when_explicitly_supplied():
     with TemporaryDirectory() as raw:
         root = Path(raw)
@@ -510,11 +701,11 @@ def test_orchestration_requires_typed_host_coverage_for_operating_states():
             "- id: repeat-fix\n"
             "  status: fix-applied\n"
             "  wired_check: next run invokes the fixture skill\n"
-            "  artifact_ids: [fixture/SKILL.md]\n"
+            "  artifact_ids: [claude:global:.claude/skills/fixture/SKILL.md]\n"
         )
         digest_path = manifest["source_files"][0]["digest_path"]
         coverage = CoverageObservation(
-            artifact_id="fixture/SKILL.md",
+            artifact_id="claude:global:.claude/skills/fixture/SKILL.md",
             artifact_kind="skills",
             eligible=True,
             trigger_evidence=(

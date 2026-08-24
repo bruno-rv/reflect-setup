@@ -60,6 +60,15 @@ class Signal:
 
 
 @_frozen_dataclass
+class EvidenceIndexEntry:
+    source_line: int
+    timestamp: datetime
+    kind: SignalKind
+    project: str
+    session_id: str
+
+
+@_frozen_dataclass
 class SourceFile:
     source_path: str
     sha256: str
@@ -72,6 +81,7 @@ class SourceFile:
     project: str
     digest_path: str | None
     thread_source: str | None = None
+    evidence_index: tuple[EvidenceIndexEntry, ...] = ()
 
 
 @_frozen_dataclass
@@ -454,6 +464,16 @@ def _manifest_json(manifest: DigestManifest):
                 "project": source.project,
                 "digest_path": source.digest_path,
                 "thread_source": source.thread_source,
+                "evidence_index": [
+                    {
+                        "source_line": entry.source_line,
+                        "timestamp": _signal_timestamp(entry.timestamp),
+                        "kind": entry.kind.value,
+                        "project": entry.project,
+                        "session_id": entry.session_id,
+                    }
+                    for entry in source.evidence_index
+                ],
             }
             for source in manifest.source_files
         ],
@@ -544,6 +564,7 @@ def _scan_typed_source(spec, scope, relative_path, path):
             project=source_project,
             digest_path=None,
             thread_source=None,
+            evidence_index=(),
         )
         return source, (), False, (not scope.project_filter or spec.runtime is Runtime.CLAUDE)
 
@@ -588,6 +609,27 @@ def _scan_typed_source(spec, scope, relative_path, path):
         project=metadata_project if spec.runtime is Runtime.CODEX else source_project,
         digest_path=None,
         thread_source=metadata_thread_source if spec.runtime is Runtime.CODEX else None,
+        evidence_index=tuple(
+            sorted(
+                (
+                    EvidenceIndexEntry(
+                        source_line=signal.source_line,
+                        timestamp=signal.timestamp,
+                        kind=signal.kind,
+                        project=metadata_project if spec.runtime is Runtime.CODEX else source_project,
+                        session_id=signal.session_id,
+                    )
+                    for signal in typed_signals
+                ),
+                key=lambda entry: (
+                    entry.source_line,
+                    entry.timestamp,
+                    entry.kind.value,
+                    entry.project,
+                    entry.session_id,
+                ),
+            )
+        ),
     )
     metadata_complete = (
         spec.runtime is not Runtime.CODEX
@@ -642,6 +684,7 @@ def run_digest(spec: RuntimeSpec, scope: Scope, out_dir: Path) -> DigestManifest
             project=original.project,
             digest_path=digest_path,
             thread_source=original.thread_source,
+            evidence_index=original.evidence_index,
         )
 
     manifest = DigestManifest(
