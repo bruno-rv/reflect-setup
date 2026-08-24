@@ -25,19 +25,33 @@ class CheckStatus(str, Enum):
     INSUFFICIENT = "insufficient"
 
 
+class CheckName(str, Enum):
+    SYMPTOM = "symptom"
+    INVOCATION = "invocation"
+    OUTCOME = "outcome"
+
+
+class VerificationLabel(str, Enum):
+    SYMPTOM_ABSENT = "symptom-absent"
+    SYMPTOM_RECURRED = "symptom-recurred"
+    INVOKED = "invoked"
+    OUTCOME_PASS = "outcome-pass"
+    OUTCOME_FAIL = "outcome-fail"
+
+
 @_frozen_dataclass
 class VerificationEvidence:
-    """One current-window reference with a semantic verification label."""
+    """One current-window reference with a constrained semantic label."""
 
     ref: EvidenceRef
-    label: str
+    label: VerificationLabel
 
 
 @_frozen_dataclass
 class VerificationCheck:
-    name: str
+    name: CheckName
     status: CheckStatus
-    evidence: tuple[VerificationEvidence, ...]
+    evidence: tuple[EvidenceRef, ...]
     detail: str
 
 
@@ -51,36 +65,35 @@ class FixVerification:
     recommended_status: str
 
 
-_WORD_RE = re.compile(r"[a-z0-9]+")
+_ALLOWED_LABELS = frozenset(item.value for item in VerificationLabel)
 
 
-def _phrase(label: str, *parts: str) -> bool:
-    normalized = " ".join(_WORD_RE.findall(label.casefold().replace("_", " ")))
-    return any(
-        " ".join(_WORD_RE.findall(part.casefold().replace("_", " "))) in normalized
-        for part in parts
-    )
+def _label_value(label: VerificationLabel | str, field: str) -> str:
+    value = label.value if isinstance(label, VerificationLabel) else label
+    if not isinstance(value, str) or value not in _ALLOWED_LABELS:
+        allowed = ", ".join(sorted(_ALLOWED_LABELS))
+        raise ValueError(f"{field} label must be one of: {allowed}")
+    return value
 
 
 def _coerce_evidence(
     values: Iterable[VerificationEvidence] | None,
-    label: str,
+    field: str,
 ) -> tuple[VerificationEvidence, ...]:
     if values is None:
-        raise TypeError(f"{label} must be a sequence of VerificationEvidence")
+        raise TypeError(f"{field} must be a sequence of VerificationEvidence")
     evidence = tuple(values)
     for item in evidence:
         if not isinstance(item, VerificationEvidence):
-            raise TypeError(f"{label} must contain VerificationEvidence instances")
+            raise TypeError(f"{field} must contain VerificationEvidence instances")
         if not isinstance(item.ref, EvidenceRef):
-            raise TypeError(f"{label} references must contain EvidenceRef instances")
-        if not isinstance(item.label, str) or not item.label.strip():
-            raise ValueError(f"{label} evidence labels must be non-empty")
+            raise TypeError(f"{field} references must contain EvidenceRef instances")
+        _label_value(item.label, field)
     return evidence
 
 
 def _check_evidence(
-    name: str,
+    name: CheckName,
     evidence: tuple[VerificationEvidence, ...],
     status: CheckStatus,
     detail: str,
@@ -89,7 +102,7 @@ def _check_evidence(
     return VerificationCheck(
         name=name,
         status=status,
-        evidence=evidence,
+        evidence=tuple(item.ref for item in evidence),
         detail=f"wired_check={wired_check}; {detail}",
     )
 
@@ -97,30 +110,10 @@ def _check_evidence(
 def _symptom_status(evidence: tuple[VerificationEvidence, ...]) -> tuple[CheckStatus, str]:
     if not evidence:
         return CheckStatus.INSUFFICIENT, "no explicit non-recurrence evidence"
-    labels = tuple(item.label for item in evidence)
-    if any(
-        _phrase(label, "recurred", "recurrence", "returned", "reappeared", "regression")
-        or _phrase(label, "symptom present", "symptom fail")
-        for label in labels
-    ):
+    labels = {_label_value(item.label, "symptom_evidence") for item in evidence}
+    if VerificationLabel.SYMPTOM_RECURRED.value in labels:
         return CheckStatus.FAIL, "current symptom recurrence is present"
-    if any(
-        _phrase(
-            label,
-            "absent",
-            "cleared",
-            "gone",
-            "non-recurred",
-            "non recurrence",
-            "nonrecurrence",
-            "not recurred",
-            "no recurrence",
-            "not present",
-            "no symptom",
-        )
-        or _phrase(label, "symptom pass", "symptom resolved")
-        for label in labels
-    ):
+    if VerificationLabel.SYMPTOM_ABSENT.value in labels:
         return CheckStatus.PASS, "explicit non-recurrence evidence is present"
     return CheckStatus.INSUFFICIENT, "evidence does not explicitly establish non-recurrence"
 
@@ -128,24 +121,16 @@ def _symptom_status(evidence: tuple[VerificationEvidence, ...]) -> tuple[CheckSt
 def _invocation_status(evidence: tuple[VerificationEvidence, ...]) -> tuple[CheckStatus, str]:
     if not evidence:
         return CheckStatus.INSUFFICIENT, "no transcript or tool invocation evidence"
-    labels = tuple(item.label for item in evidence)
-    if any(
-        _phrase(label, "not invoked", "never invoked", "not loaded", "never loaded", "not called")
-        or _phrase(label, "invocation fail", "invocation missing")
-        for label in labels
-    ):
+    labels = {_label_value(item.label, "invocation_evidence") for item in evidence}
+    if VerificationLabel.OUTCOME_FAIL.value in labels or VerificationLabel.SYMPTOM_RECURRED.value in labels:
         return CheckStatus.FAIL, "artifact was not shown as loaded or called"
-    if any(
-        _phrase(label, "invoked", "loaded", "called", "triggered")
-        or _phrase(label, "invocation pass")
-        for label in labels
-    ):
+    if VerificationLabel.INVOKED.value in labels:
         return CheckStatus.PASS, "transcript or tool evidence shows the artifact was loaded or called"
     return CheckStatus.INSUFFICIENT, "evidence does not show the artifact was loaded or called"
 
 
-def _evidence_key(item: VerificationEvidence) -> tuple[str, int]:
-    return item.ref.digest_path, item.ref.source_line
+def _evidence_key(ref: EvidenceRef) -> tuple[str, int]:
+    return ref.digest_path, ref.source_line
 
 
 def _outcome_status(
@@ -154,62 +139,83 @@ def _outcome_status(
 ) -> tuple[CheckStatus, str]:
     if not evidence:
         return CheckStatus.INSUFFICIENT, "no independent success or behavioral evidence"
-    labels = tuple(item.label for item in evidence)
-    if any(
-        _phrase(label, "outcome fail", "failed", "failure", "error", "unsuccessful", "regressed")
-        for label in labels
-    ):
+    outcome_keys = {_evidence_key(item.ref) for item in evidence}
+    invocation_keys = {_evidence_key(item.ref) for item in invocation_evidence}
+    if outcome_keys.intersection(invocation_keys):
+        return CheckStatus.INSUFFICIENT, "outcome evidence is not separate from invocation evidence"
+    labels = {_label_value(item.label, "outcome_evidence") for item in evidence}
+    if VerificationLabel.OUTCOME_FAIL.value in labels:
         return CheckStatus.FAIL, "behavioral outcome shows failure"
-    passing = tuple(
-        item
-        for item in evidence
-        if _phrase(item.label, "outcome pass", "success", "successful", "prevented", "behavior pass")
-    )
-    if not passing:
-        return CheckStatus.INSUFFICIENT, "evidence does not show a successful behavioral outcome"
-    if any(_phrase(item.label, "inventory coverage") for item in passing):
-        return CheckStatus.PASS, "independent success is certified by inventory coverage"
-    invocation_keys = {_evidence_key(item) for item in invocation_evidence}
-    if not any(_evidence_key(item) not in invocation_keys for item in passing):
-        return CheckStatus.INSUFFICIENT, "success evidence is not separate from invocation evidence"
-    return CheckStatus.PASS, "independent success or behavioral evidence is present"
+    if VerificationLabel.OUTCOME_PASS.value in labels:
+        return CheckStatus.PASS, "independent success or behavioral evidence is present"
+    return CheckStatus.INSUFFICIENT, "evidence does not show a successful behavioral outcome"
 
 
 def _cluster_key(value: str) -> str:
-    return "-".join(_WORD_RE.findall(value.casefold()))
+    return re.sub(r"[^a-z0-9]+", "-", value.casefold()).strip("-")
 
 
-def _coverage_evidence(
+def _target_ids(entry: LedgerEntry, explicit: Iterable[str]) -> frozenset[str]:
+    target_values = (explicit,) if isinstance(explicit, str) else tuple(explicit)
+    if not target_values:
+        if not isinstance(entry.wired_check, str) or not entry.wired_check.strip():
+            return frozenset()
+        target_values = (entry.wired_check.strip(),)
+    if any(not isinstance(value, str) or not value.strip() for value in target_values):
+        raise ValueError("target_artifact_ids must contain non-empty strings")
+    return frozenset(value.strip() for value in target_values)
+
+
+def _coverage_contribution(
     records: tuple[CoverageRecord, ...],
+    targets: frozenset[str],
+    invocation_evidence: tuple[VerificationEvidence, ...],
+    outcome_evidence: tuple[VerificationEvidence, ...],
 ) -> tuple[tuple[VerificationEvidence, ...], tuple[VerificationEvidence, ...]]:
+    """Use each aggregate coverage record on one side of the evidence split.
+
+    ``CoverageRecord.evidence`` is a combined sequence in the preceding
+    coverage interface. It may contribute invocation evidence when no explicit
+    invocation exists, or certified outcome evidence when invocation evidence
+    already exists, but never both. This preserves disjoint evidence keys.
+    """
+    invocation_keys = {_evidence_key(item.ref) for item in invocation_evidence}
+    outcome_keys = {_evidence_key(item.ref) for item in outcome_evidence}
     invocation: list[VerificationEvidence] = []
     outcome: list[VerificationEvidence] = []
     for record in records:
-        if record.triggered:
-            invocation.extend(VerificationEvidence(ref, "invoked (inventory coverage)") for ref in record.evidence)
-        if record.prevented is True:
-            outcome.extend(VerificationEvidence(ref, "outcome-pass (inventory coverage)") for ref in record.evidence)
-        elif record.prevented is False:
-            outcome.extend(VerificationEvidence(ref, "outcome-fail (inventory coverage)") for ref in record.evidence)
+        if record.artifact_id not in targets or not record.declared or not record.eligible:
+            continue
+        refs = tuple(record.evidence)
+        if any(not isinstance(ref, EvidenceRef) for ref in refs):
+            raise TypeError("coverage record evidence must contain EvidenceRef instances")
+        if record.triggered and not invocation_evidence:
+            invocation.extend(VerificationEvidence(ref, VerificationLabel.INVOKED) for ref in refs)
+            invocation_keys.update(_evidence_key(ref) for ref in refs)
+        if record.triggered and record.prevented is True and invocation_evidence and not outcome_evidence:
+            for ref in refs:
+                key = _evidence_key(ref)
+                if key not in invocation_keys and key not in outcome_keys:
+                    outcome.append(VerificationEvidence(ref, VerificationLabel.OUTCOME_PASS))
+        elif record.triggered and record.prevented is False and invocation_evidence and not outcome_evidence:
+            for ref in refs:
+                key = _evidence_key(ref)
+                if key not in invocation_keys and key not in outcome_keys:
+                    outcome.append(VerificationEvidence(ref, VerificationLabel.OUTCOME_FAIL))
     return tuple(invocation), tuple(outcome)
 
 
 def verify_fix(
     entry: LedgerEntry,
-    symptom_evidence: Iterable[VerificationEvidence],
-    invocation_evidence: Iterable[VerificationEvidence],
-    outcome_evidence: Iterable[VerificationEvidence],
     *,
+    symptom_evidence: tuple[VerificationEvidence, ...],
+    invocation_evidence: tuple[VerificationEvidence, ...],
+    outcome_evidence: tuple[VerificationEvidence, ...],
     merged_findings: Iterable[Finding] = (),
     coverage_records: Iterable[CoverageRecord] = (),
+    target_artifact_ids: Iterable[str] = (),
 ) -> FixVerification:
-    """Verify symptom absence, invocation, and independent outcome separately.
-
-    ``merged_findings`` and ``coverage_records`` are optional adapters for the
-    preceding merge and inventory phases.  A finding for this ledger cluster
-    is explicit recurrence evidence; coverage records can supply invocation or
-    outcome evidence when their typed references are available.
-    """
+    """Verify symptom absence, invocation, and independent outcome separately."""
     if not isinstance(entry, LedgerEntry):
         raise TypeError("entry must be a LedgerEntry")
     if not isinstance(entry.cluster_id, str) or not entry.cluster_id.strip():
@@ -226,6 +232,7 @@ def verify_fix(
     outcome = list(_coerce_evidence(outcome_evidence, "outcome_evidence"))
     findings = tuple(merged_findings)
     records = tuple(coverage_records)
+    targets = _target_ids(entry, target_artifact_ids)
     for finding in findings:
         if not isinstance(finding, Finding):
             raise TypeError("merged_findings must contain Finding instances")
@@ -233,11 +240,13 @@ def verify_fix(
             for ref in finding.evidence:
                 if not isinstance(ref, EvidenceRef):
                     raise TypeError("merged_findings evidence must contain EvidenceRef instances")
-                symptom.append(VerificationEvidence(ref, "symptom-recurred (merged finding)"))
+                symptom.append(VerificationEvidence(ref, VerificationLabel.SYMPTOM_RECURRED))
     for record in records:
         if not isinstance(record, CoverageRecord):
             raise TypeError("coverage_records must contain CoverageRecord instances")
-    coverage_invocation, coverage_outcome = _coverage_evidence(records)
+    coverage_invocation, coverage_outcome = _coverage_contribution(
+        records, targets, tuple(invocation), tuple(outcome)
+    )
     if not invocation:
         invocation.extend(coverage_invocation)
     if not outcome:
@@ -249,11 +258,15 @@ def verify_fix(
     symptom_status, symptom_detail = _symptom_status(symptom_values)
     invocation_status, invocation_detail = _invocation_status(invocation_values)
     outcome_status, outcome_detail = _outcome_status(outcome_values, invocation_values)
-    symptom_check = _check_evidence("symptom", symptom_values, symptom_status, symptom_detail, entry.wired_check)
-    invocation_check = _check_evidence(
-        "invocation", invocation_values, invocation_status, invocation_detail, entry.wired_check
+    symptom_check = _check_evidence(
+        CheckName.SYMPTOM, symptom_values, symptom_status, symptom_detail, entry.wired_check
     )
-    outcome_check = _check_evidence("outcome", outcome_values, outcome_status, outcome_detail, entry.wired_check)
+    invocation_check = _check_evidence(
+        CheckName.INVOCATION, invocation_values, invocation_status, invocation_detail, entry.wired_check
+    )
+    outcome_check = _check_evidence(
+        CheckName.OUTCOME, outcome_values, outcome_status, outcome_detail, entry.wired_check
+    )
     checks = (symptom_check, invocation_check, outcome_check)
     if any(check.status is CheckStatus.FAIL for check in checks):
         overall = CheckStatus.FAIL
@@ -277,9 +290,11 @@ def verify_fix(
 
 
 __all__ = [
+    "CheckName",
     "CheckStatus",
     "FixVerification",
     "VerificationCheck",
     "VerificationEvidence",
+    "VerificationLabel",
     "verify_fix",
 ]

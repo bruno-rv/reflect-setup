@@ -53,7 +53,12 @@ def test_resolved_fix_regresses_when_symptom_returns():
 
 def test_applied_entry_without_wired_check_is_rejected():
     try:
-        verify_fix(make_entry("bad-entry", wired_check=""), (), (), ())
+        verify_fix(
+            make_entry("bad-entry", wired_check=""),
+            symptom_evidence=(),
+            invocation_evidence=(),
+            outcome_evidence=(),
+        )
     except ValueError as exc:
         assert "wired_check" in str(exc)
     else:
@@ -70,9 +75,9 @@ def test_checks_preserve_exact_evidence_references_and_details():
         invocation_evidence=invocation,
         outcome_evidence=outcome,
     )
-    assert result.symptom.evidence == symptom
-    assert result.invocation.evidence == invocation
-    assert result.outcome.evidence == outcome
+    assert result.symptom.evidence == tuple(item.ref for item in symptom)
+    assert result.invocation.evidence == tuple(item.ref for item in invocation)
+    assert result.outcome.evidence == tuple(item.ref for item in outcome)
     assert "fixture evidence" in result.symptom.detail
     assert result.symptom.detail
     assert result.invocation.detail
@@ -80,12 +85,15 @@ def test_checks_preserve_exact_evidence_references_and_details():
 
 
 def test_outcome_reusing_invocation_evidence_is_insufficient():
+    from verification import VerificationEvidence
+
     invocation = make_evidence_set("invoked")
+    outcome = tuple(VerificationEvidence(item.ref, "outcome-pass") for item in invocation)
     result = verify_fix(
         make_entry("fixture"),
         symptom_evidence=make_evidence_set("symptom-absent"),
         invocation_evidence=invocation,
-        outcome_evidence=invocation,
+        outcome_evidence=outcome,
     )
     assert result.invocation.status is CheckStatus.PASS
     assert result.outcome.status is CheckStatus.INSUFFICIENT
@@ -126,15 +134,97 @@ def test_independent_inventory_coverage_can_supply_invocation_and_outcome():
         symptom_recurred=False,
     )
     result = verify_fix(
-        make_entry("fixture"),
+        make_entry("fixture", wired_check="skill:fixture"),
         symptom_evidence=make_evidence_set("symptom-absent"),
-        invocation_evidence=(),
+        invocation_evidence=make_evidence_set("invoked"),
         outcome_evidence=(),
         coverage_records=(record,),
     )
     assert result.invocation.status is CheckStatus.PASS
     assert result.outcome.status is CheckStatus.PASS
+    assert set(result.invocation.evidence).isdisjoint(result.outcome.evidence)
     assert result.overall is CheckStatus.PASS
+
+
+def test_failed_invocation_is_not_operating():
+    result = verify_fix(
+        make_entry("fixture"),
+        symptom_evidence=make_evidence_set("symptom-absent"),
+        invocation_evidence=make_evidence_set("outcome-fail"),
+        outcome_evidence=make_evidence_set("outcome-pass"),
+    )
+    assert result.invocation.status is CheckStatus.FAIL
+    assert result.overall is CheckStatus.FAIL
+
+
+def test_failed_outcome_is_not_resolved():
+    result = verify_fix(
+        make_entry("fixture"),
+        symptom_evidence=make_evidence_set("symptom-absent"),
+        invocation_evidence=make_evidence_set("invoked"),
+        outcome_evidence=make_evidence_set("outcome-fail"),
+    )
+    assert result.outcome.status is CheckStatus.FAIL
+    assert result.overall is CheckStatus.FAIL
+
+
+def test_ineligible_coverage_cannot_prove_invocation_or_outcome():
+    from coverage_model import assess_coverage
+    from test_support import make_evidence
+
+    record = assess_coverage(
+        artifact_id="skill:fixture",
+        artifact_kind="skill",
+        exists=False,
+        eligible=False,
+        trigger_evidence=(make_evidence("trigger.md", 3, "trigger"),),
+        prevention_evidence=(make_evidence("outcome.md", 8, "outcome"),),
+        symptom_recurred=False,
+    )
+    result = verify_fix(
+        make_entry("fixture", wired_check="skill:fixture"),
+        symptom_evidence=make_evidence_set("symptom-absent"),
+        invocation_evidence=(),
+        outcome_evidence=(),
+        coverage_records=(record,),
+    )
+    assert result.invocation.status is CheckStatus.INSUFFICIENT
+    assert result.outcome.status is CheckStatus.INSUFFICIENT
+    assert result.overall is CheckStatus.INSUFFICIENT
+
+
+def test_unrelated_coverage_cannot_contribute_to_a_fix():
+    from coverage_model import assess_coverage
+    from test_support import make_evidence
+
+    record = assess_coverage(
+        artifact_id="skill:other",
+        artifact_kind="skill",
+        exists=True,
+        eligible=True,
+        trigger_evidence=(make_evidence("trigger.md", 3, "trigger"),),
+        prevention_evidence=(make_evidence("outcome.md", 8, "outcome"),),
+        symptom_recurred=False,
+    )
+    result = verify_fix(
+        make_entry("fixture", wired_check="skill:fixture"),
+        symptom_evidence=make_evidence_set("symptom-absent"),
+        invocation_evidence=(),
+        outcome_evidence=(),
+        coverage_records=(record,),
+    )
+    assert result.invocation.status is CheckStatus.INSUFFICIENT
+    assert result.outcome.status is CheckStatus.INSUFFICIENT
+    assert result.overall is CheckStatus.INSUFFICIENT
+
+
+def test_verify_fix_evidence_arguments_are_keyword_only():
+    try:
+        verify_fix(make_entry("fixture"), (), (), ())
+    except TypeError as exc:
+        assert "positional" in str(exc)
+    else:
+        raise AssertionError("verification evidence must be keyword-only")
 
 
 def run_all():
