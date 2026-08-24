@@ -155,11 +155,15 @@ matching `kind`, explicit `project` identity, and a positive
 `occurrence_count`. The finding count must equal the sum of distinct evidence
 counts; overlapping reports count each evidence key once.
 
-The manifest also stores an evidence index for every retained signal. The path,
-source line, timestamp, kind, and project in a miner reference must match that
-index exactly, and `finding.session_id` must equal the session ID for every
-cited entry. Nonexistent lines, invented metadata, and mixed-session findings
-fail closed.
+The manifest also stores a source evidence index for every retained signal. A
+miner reference's `source_line`, `timestamp`, and `project`, together with its
+finding's `session_id`, must match the indexed entry exactly. Evidence `kind`
+is the selected finding classification: it must equal `finding_type` and be
+compatible with the indexed `source_kind` (the persisted index `kind` field):
+`user` accepts any finding type, `error` accepts only `failure`, and
+`interrupt` accepts only `friction` or `failure`. Nonexistent lines, invented
+metadata, incompatible classifications, and mixed-session findings fail
+closed.
 
 The report's ordered `digest_paths` must equal its assigned `BatchSpec`. Across
 all reports, each non-empty manifest digest path must occur in exactly one
@@ -171,8 +175,10 @@ an empty report set.
 
 Validated reports merge only true duplicates sharing normalized cluster,
 finding type, and session. Evidence identity remains `(digest_path, source_line)`
-for aggregation, while its timestamp/kind/project/session metadata is bound to
-the manifest evidence index; project identity is never inferred from filenames.
+for aggregation, while its timestamp/project/session metadata is bound to the
+manifest source evidence index. Classified evidence `kind` must equal the
+finding type and satisfy the indexed source-kind mapping; project identity is
+never inferred from filenames.
 
 For each touched operating ledger entry, evaluate three independent checks
 against its declared `artifact_ids` and human-readable `wired_check`:
