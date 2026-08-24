@@ -17,9 +17,22 @@ JSON object below.
 Interrupt markers are context for `failure` or `friction`; they are not a
 standalone finding type.
 
-Only `[user]` and `[error]` digest lines are signal candidates. Discount
-skill-listing boilerplate, background-agent notifications, and any text that
-looks like source code or raw file contents.
+Each retained signal line has labeled digest-visible metadata in this stable
+shape:
+
+```text
+- source_line=7 timestamp=2026-08-23T10:00:00Z kind=user project=project-a session_id=session-a :: signal text
+```
+
+`source_line` is the original JSONL source line, not the line number of the
+rendered digest file. Copy it exactly; never substitute the digest-local line
+number or invent a value. The `timestamp`, `kind`, `project`, and `session_id`
+labels are the signal's identity and must remain consistent with the cited
+evidence.
+
+Only digest lines with `kind=user` or `kind=error` are signal candidates.
+Discount skill-listing boilerplate, background-agent notifications, and any
+text that looks like source code or raw file contents.
 
 ## Assigned batch
 
@@ -86,7 +99,9 @@ Rules for the fields:
   digest `source_line`, and includes an RFC 3339 timestamp with timezone.
   Evidence is typed, has a positive `occurrence_count`, and must point to the
   signal supporting that finding. Copy `source_line`, timestamp, kind, and
-  project exactly from the manifest evidence index; do not invent metadata.
+  project exactly from the labeled digest metadata and verify them against the
+  manifest evidence index; do not invent metadata or use a digest-local line
+  number. Copy the digest `session_id` into the finding's `session_id`.
   Every cited index entry must belong to the finding's `session_id`, and a
   finding must not mix sessions.
 - `themes` is an array of zero, one, or two short strings. Do not include more

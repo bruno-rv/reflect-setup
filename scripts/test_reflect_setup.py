@@ -50,6 +50,93 @@ def test_run_reflection_produces_manifest_report_and_ranked_candidates():
         assert result.apply_preview is None
 
 
+def test_end_to_end_honest_digest_evidence_passes_and_digest_local_line_fails():
+    with TemporaryDirectory() as raw:
+        root = Path(raw)
+        source = root / "projects" / "project-a"
+        source.mkdir(parents=True)
+        context = "".join(
+            '{{"type":"assistant","timestamp":"2026-08-23T10:0{0}:00Z",'
+            '"message":{{"role":"assistant","content":[{{"type":"text",'
+            '"text":"context"}}]}}}}\n'.format(index)
+            for index in range(6)
+        )
+        (source / "session.jsonl").write_text(
+            context
+            + '{"type":"user","timestamp":"2026-08-23T10:06:00Z",'
+            '"message":{"role":"user","content":"please fix this"}}\n'
+        )
+        kwargs = dict(
+            runtime_name="claude",
+            home=root,
+            source_root=root / "projects",
+            since=datetime(2026, 8, 23, tzinfo=timezone.utc),
+            project_filter=None,
+            include_subagents=False,
+            out_dir=root / "run",
+            apply=False,
+        )
+        try:
+            run_reflection(miner_report_paths=(), **kwargs)
+        except ReportValidationError:
+            pass
+        else:
+            raise AssertionError("signal-bearing run must wait for miner coverage")
+
+        manifest = json.loads((root / "run" / "manifest.json").read_text())
+        source_entry = manifest["source_files"][0]
+        digest_path = Path(source_entry["digest_path"])
+        signal_lines = [
+            (index, line)
+            for index, line in enumerate(digest_path.read_text().splitlines(), 1)
+            if line.startswith("- ")
+        ]
+        local_line, rendered = signal_lines[0]
+        fields, _ = rendered[2:].split(" :: ", 1)
+        visible = dict(field.split("=", 1) for field in fields.split())
+        honest = {
+            "schema_version": 1,
+            "runtime": "claude",
+            "run_id": manifest["run_id"],
+            "batch_id": "batch-a",
+            "digest_paths": [source_entry["digest_path"]],
+            "findings": [
+                {
+                    "cluster_key": "repeat-fix",
+                    "finding_type": "failure",
+                    "session_id": visible["session_id"],
+                    "paraphrase": "the same fix is requested",
+                    "occurrence_count": 1,
+                    "confidence": 0.9,
+                    "evidence": [
+                        {
+                            "digest_path": source_entry["digest_path"],
+                            "source_line": int(visible["source_line"]),
+                            "timestamp": visible["timestamp"],
+                            "kind": "failure",
+                            "project": visible["project"],
+                        }
+                    ],
+                }
+            ],
+            "themes": [],
+        }
+        report = root / "honest-miner-report.json"
+        report.write_text(json.dumps(honest))
+        result = run_reflection(miner_report_paths=(report,), **kwargs)
+        assert result.ranked_candidates[0].cluster_key == "repeat-fix"
+
+        dishonest = json.loads(json.dumps(honest))
+        dishonest["findings"][0]["evidence"][0]["source_line"] = local_line
+        report.write_text(json.dumps(dishonest))
+        try:
+            run_reflection(miner_report_paths=(report,), **kwargs)
+        except ReportValidationError as exc:
+            assert "retained source line" in str(exc)
+        else:
+            raise AssertionError("digest-local source lines must fail evidence validation")
+
+
 def test_inventory_ids_namespace_runtime_and_global_project_root_origin():
     with TemporaryDirectory() as raw:
         root = Path(raw)

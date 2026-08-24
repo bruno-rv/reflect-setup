@@ -182,6 +182,56 @@ def test_manifest_indexes_each_retained_signal_with_source_truth():
         ]
 
 
+def test_typed_digest_exposes_source_line_and_signal_identity():
+    with TemporaryDirectory() as raw:
+        root = Path(raw)
+        source_root = root / "projects" / "project-a"
+        source_root.mkdir(parents=True)
+        lines = [
+            make_line(
+                {
+                    "type": "assistant",
+                    "timestamp": f"2026-08-23T10:0{index}:00Z",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "context"}],
+                    },
+                }
+            )
+            for index in range(6)
+        ]
+        lines.append(
+            make_line(
+                {
+                    "type": "user",
+                    "timestamp": "2026-08-23T10:06:00Z",
+                    "message": {"role": "user", "content": "please fix this"},
+                }
+            )
+        )
+        (source_root / "session.jsonl").write_text("".join(lines))
+        spec = resolve_runtime("claude", home=root, env={}, source_root=source_root.parent)
+        manifest = run_digest(
+            spec,
+            Scope(datetime(2026, 8, 23, tzinfo=timezone.utc), None, False),
+            root / "out",
+        )
+        digest_path = Path(manifest.source_files[0].digest_path)
+        signal_line = next(
+            line for line in digest_path.read_text().splitlines() if line.startswith("- ")
+        )
+        fields, text = signal_line[2:].split(" :: ", 1)
+        visible = dict(field.split("=", 1) for field in fields.split())
+        assert visible == {
+            "source_line": "7",
+            "timestamp": "2026-08-23T10:06:00Z",
+            "kind": "user",
+            "project": "project-a",
+            "session_id": "session",
+        }
+        assert text == "please fix this"
+
+
 def test_old_event_is_excluded_from_recent_file_and_output_is_collision_free():
     with TemporaryDirectory() as raw:
         root = Path(raw)

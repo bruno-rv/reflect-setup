@@ -113,6 +113,18 @@ scope, source paths and SHA-256 hashes, and every digest path's existence,
 run-directory containment, and persisted digest hash. Changed source or digest
 bytes, deleted files, path escapes, or tampered manifest metadata fail closed.
 
+Each retained signal in a digest carries its source identity directly on the
+rendered line:
+
+```text
+- source_line=7 timestamp=2026-08-23T10:00:00Z kind=user project=project-a session_id=session-a :: signal text
+```
+
+`source_line` always means the original JSONL line. It is not the rendered
+digest's local line number. Miners must copy `source_line`, `timestamp`,
+`kind`, `project`, and `session_id` from these labeled fields, then use the
+manifest evidence index as the validation check before returning a report.
+
 ## Miner contract and batches
 
 Every report is one JSON object with exactly these top-level fields:

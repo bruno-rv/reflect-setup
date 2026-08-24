@@ -436,7 +436,12 @@ def _write_typed_digest(
         raise FileExistsError(f"digest output collision: {path}")
     lines = [f"# {session_id}\n", f"# project: {project}\n", "\n"]
     for signal in signals:
-        lines.append(f"- {_signal_timestamp(signal.timestamp)} [{signal.kind.value}] {signal.text}\n")
+        lines.append(
+            f"- source_line={signal.source_line} "
+            f"timestamp={_signal_timestamp(signal.timestamp)} "
+            f"kind={signal.kind.value} project={project} "
+            f"session_id={signal.session_id} :: {signal.text}\n"
+        )
     _atomic_write(path, "".join(lines))
     return str(path)
 
