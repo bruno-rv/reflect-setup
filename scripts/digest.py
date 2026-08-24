@@ -29,6 +29,14 @@ USER_TRUNCATE = 500
 ERROR_TRUNCATE = 300
 INTERRUPT_MARKER = "[Request interrupted"
 UTC = timezone.utc
+FAILURE_STATUS = re.compile(
+    r"^(?:(?:script|command|process)\s+(?:failed|error)\b|"
+    r"(?:script|command|process)\s+exited\s+with\s+(?:code|status)\s+[1-9]\d*\b|"
+    r"(?:exit\s+code|status)\s*[:=]\s*(?:[1-9]\d*|error|failed|failure)\b|"
+    r"(?:non[- ]?zero)\s+exit\b|"
+    r"(?:error|failure)\s*[:!-])",
+    re.IGNORECASE,
+)
 
 
 def _frozen_dataclass(cls):
@@ -230,6 +238,17 @@ def _codex_error_text(payload):
     return ""
 
 
+def _codex_failure_text(payload):
+    """Return output only when its first status line explicitly signals failure."""
+    if not isinstance(payload, dict):
+        return ""
+    for key in ("output", "content"):
+        text = _text_value(payload.get(key)).strip()
+        if text and FAILURE_STATUS.search(text.splitlines()[0].strip()):
+            return text
+    return ""
+
+
 def _codex_signals(entry):
     """Return untyped signal tuples from canonical Codex user/error events."""
     if not isinstance(entry, dict):
@@ -264,6 +283,7 @@ def _codex_signals(entry):
         result.append(("interrupt", truncate(text, USER_TRUNCATE)))
 
     tool_error_type = payload_type in (
+        "custom_tool_call_output",
         "tool_error",
         "tool_result",
         "function_call_output",
@@ -273,8 +293,13 @@ def _codex_signals(entry):
         "error",
     )
     is_true_error = payload.get("is_error") is True or payload_type == "tool_error"
-    if tool_error_type and is_true_error:
-        text = _codex_error_text(payload)
+    if tool_error_type:
+        if payload.get("is_error") is False:
+            text = ""
+        elif is_true_error:
+            text = _codex_error_text(payload)
+        else:
+            text = _codex_failure_text(payload)
         if text:
             result.append(("error", truncate(text, ERROR_TRUNCATE)))
     return tuple(result)

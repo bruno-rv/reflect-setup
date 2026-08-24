@@ -240,6 +240,79 @@ def test_codex_extracts_canonical_user_and_true_tool_error_only():
     ) == ()
 
 
+def test_codex_custom_tool_output_with_explicit_failure_status_is_error():
+    scope = Scope(datetime(2026, 8, 23, tzinfo=timezone.utc), None, False)
+    line = make_line(
+        {
+            "type": "response_item",
+            "timestamp": "2026-08-23T10:01:00Z",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "output": [
+                    {"type": "input_text", "text": "Process exited with code 1"},
+                    {"type": "input_text", "text": "details"},
+                ],
+            },
+        }
+    )
+    signals = signals_from_event(
+        line,
+        runtime="codex",
+        session_id="session-1",
+        source_line=1,
+        scope=scope,
+    )
+    assert len(signals) == 1 and signals[0].kind is SignalKind.ERROR, signals
+    assert signals[0].text == "Process exited with code 1\ndetails", signals[0].text
+
+
+def test_codex_function_output_with_explicit_failure_status_is_error():
+    scope = Scope(datetime(2026, 8, 23, tzinfo=timezone.utc), None, False)
+    line = make_line(
+        {
+            "type": "response_item",
+            "timestamp": "2026-08-23T10:01:00Z",
+            "payload": {
+                "type": "function_call_output",
+                "output": "Command failed\nexit code: 1\ndetails",
+            },
+        }
+    )
+    signals = signals_from_event(
+        line,
+        runtime="codex",
+        session_id="session-1",
+        source_line=1,
+        scope=scope,
+    )
+    assert len(signals) == 1 and signals[0].kind is SignalKind.ERROR, signals
+    assert signals[0].text == "Command failed\nexit code: 1\ndetails", signals[0].text
+
+
+def test_codex_successful_tool_output_with_error_looking_detail_is_ignored():
+    scope = Scope(datetime(2026, 8, 23, tzinfo=timezone.utc), None, False)
+    line = make_line(
+        {
+            "type": "response_item",
+            "timestamp": "2026-08-23T10:01:00Z",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "output": [
+                    {"type": "input_text", "text": "Script completed"},
+                    {"type": "input_text", "text": "Error: source text only"},
+                ],
+            },
+        }
+    )
+    assert signals_from_event(
+        line,
+        runtime="codex",
+        session_id="session-1",
+        source_line=1,
+        scope=scope,
+    ) == ()
+
+
 def test_numeric_timestamp_is_parsed_as_utc_and_old_events_are_excluded():
     scope = Scope(datetime(2026, 8, 23, tzinfo=timezone.utc), None, False)
     recent = make_line(
