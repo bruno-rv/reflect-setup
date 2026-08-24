@@ -57,16 +57,20 @@ class ApplyProofError(ValueError):
     """Raised when a fixer cannot prove a successful, bounded Apply."""
 
 
-_FAILURE_LINE = re.compile(
-    r"(?:\b(?:failed|failure|error|traceback)\b|"
+_NEGATIVE_STATUS = re.compile(
+    r"(?:"
+    r"\bnot\s+ok\b|"
+    r"^\s*(?:fail(?:ed|ure)?|unsuccessful)\b(?=\s*(?:[:=-]|$))|"
+    r"^\s*error\b(?=\s*(?:[:=-]|$))|"
+    r"\b(?:command|script|process)\s+(?:fail(?:ed|ure)?|error)\b|"
+    r"\b(?:command|script|process)\s+exited\s+with\s+(?:code|status)\s+[1-9]\d*\b|"
+    r"\b(?:status|result|outcome)\s*[:=]\s*(?:not\s+ok|fail(?:ed|ure)?|error|unsuccessful)\b|"
     r"\b(?:exit|status|code)\s*[:=]?\s*[1-9]\d*\b|"
-    r"\b(?:non[- ]?zero|unsuccessful)\b)",
-    re.IGNORECASE,
-)
-_SUCCESS_LINE = re.compile(
-    r"(?:\bpass(?:ed)?\b|\bok\b|\bsuccess(?:ful|fully)?\b|"
-    r"\b(?:exit|status|code)\s*[:=]?\s*0\b|"
-    r"\b(?:updated|created|applied|fixed|completed)\b)",
+    r"\b[1-9]\d*(?:\s+\w+){0,3}\s+(?:fail(?:ed|ure)?|errors?)\b|"
+    r"\b(?:failures?|errors?)\s*[:=]\s*[1-9]\d*\b|"
+    r"\b(?:non[- ]?zero)\s+exit\b|"
+    r"\b(?:ok|pass(?:ed)?|success(?:ful)?)\s*[:=]\s*(?:false|no|0)\b"
+    r")",
     re.IGNORECASE,
 )
 
@@ -105,10 +109,12 @@ def _paths(values: Iterable[Path], root: Path, *, label: str) -> tuple[Path, ...
 
 
 def _nonempty_strings(values: Iterable[str], *, label: str) -> tuple[str, ...]:
+    if isinstance(values, (str, bytes)):
+        raise TypeError(f"{label} must be a sequence of strings")
     result = tuple(values)
     if any(not isinstance(value, str) or not value.strip() for value in result):
         raise ValueError(f"{label} must contain non-empty strings")
-    return result
+    return tuple(value.strip() for value in result)
 
 
 def _validate_inventory(inventory: Inventory) -> None:
@@ -136,6 +142,10 @@ def _validated_request(request: ApplyRequest, root: Path) -> ApplyRequest:
         raise ApplyProofError("Apply request must declare at least one command")
     if not verification_commands:
         raise ApplyProofError("Apply request must declare at least one verification command")
+    if len(set(commands)) != len(commands):
+        raise ValueError("commands must be unique")
+    if len(set(verification_commands)) != len(verification_commands):
+        raise ValueError("verification_commands must be unique")
     return ApplyRequest(request.cluster_id.strip(), target_paths, commands, verification_commands)
 
 
@@ -184,17 +194,49 @@ def check_scope_overlap(first: ApplyPreview, second: ApplyPreview) -> tuple[str,
 
 
 def _nonempty_output(values: Iterable[str], *, label: str) -> tuple[str, ...]:
+    if isinstance(values, (str, bytes)):
+        raise TypeError(f"{label} must be a sequence of output lines")
     result = tuple(values)
     if not result or any(not isinstance(value, str) or not value.strip() for value in result):
         raise ApplyProofError(f"{label} must contain non-empty output")
     return result
 
 
-def _successful_lines(output: tuple[str, ...]) -> tuple[str, ...]:
-    lines = tuple(line.strip() for item in output for line in item.splitlines() if line.strip())
-    if any(_FAILURE_LINE.search(line) for line in lines):
-        raise ApplyProofError("fixer output contains a failure")
-    return tuple(line for line in lines if _SUCCESS_LINE.search(line))
+def _output_lines(output: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(line.strip() for item in output for line in item.splitlines() if line.strip())
+
+
+def _reject_negative_statuses(output: tuple[str, ...]) -> tuple[str, ...]:
+    lines = _output_lines(output)
+    if any(_NEGATIVE_STATUS.search(line) for line in lines):
+        raise ApplyProofError("fixer output contains an explicit failure status")
+    return lines
+
+
+def _validate_verification_output(
+    output: tuple[str, ...],
+    commands: tuple[str, ...],
+) -> None:
+    """Require exactly one ``<declared command> :: PASS`` line per command."""
+    lines = _reject_negative_statuses(output)
+    observed: set[str] = set()
+    for line in lines:
+        if " :: " not in line:
+            continue
+        command, status = line.rsplit(" :: ", 1)
+        command = command.strip()
+        if status.strip().upper() != "PASS":
+            raise ApplyProofError(f"verification command {command!r} did not report PASS")
+        if command not in commands:
+            raise ApplyProofError(f"verification command {command!r} was not declared")
+        if command in observed:
+            raise ApplyProofError(f"verification command {command!r} has duplicate output")
+        observed.add(command)
+    missing = tuple(command for command in commands if command not in observed)
+    if missing:
+        raise ApplyProofError(
+            "verification output is missing commands: " + ", ".join(missing)
+        )
 
 
 def validate_proof(preview: ApplyPreview, proof: FixProof) -> None:
@@ -212,11 +254,8 @@ def validate_proof(preview: ApplyPreview, proof: FixProof) -> None:
         proof.verification_output,
         label="verification_output",
     )
-    _successful_lines(command_output)
-    verification_lines = _successful_lines(verification_output)
-    required = len(preview.request.verification_commands)
-    if len(verification_lines) < required:
-        raise ApplyProofError("verification_output lacks a successful line for every command")
+    _reject_negative_statuses(command_output)
+    _validate_verification_output(verification_output, preview.request.verification_commands)
 
     root = _root(preview.workspace_state)
     changed_paths = _paths(proof.changed_paths, root, label="changed_paths")

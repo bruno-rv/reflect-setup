@@ -1,7 +1,7 @@
 """Focused safety and proof checks for the opt-in Apply phase."""
 from pathlib import Path
 
-from apply import ApplyScopeError, build_preview, check_scope_overlap, validate_proof
+from apply import ApplyProofError, ApplyScopeError, build_preview, check_scope_overlap, validate_proof
 from test_support import make_inventory, make_preview, make_proof, make_request, make_workspace
 
 
@@ -42,7 +42,7 @@ def test_proof_requires_only_new_in_scope_paths_and_command_output():
     proof = make_proof(
         changed_paths=(Path(".claude/hooks/retry.sh"),),
         command_output=("updated hook",),
-        verification_output=("1 test passed",),
+        verification_output=("true :: PASS",),
         passed=True,
     )
     validate_proof(preview, proof)
@@ -52,8 +52,8 @@ def test_proof_accepts_nonempty_fixer_output_without_status_marker():
     preview = make_preview()
     proof = make_proof(
         changed_paths=(Path("SKILL.md"),),
-        command_output=("changed one file",),
-        verification_output=("ok",),
+        command_output=("0 failures", "error handling updated"),
+        verification_output=("true :: PASS",),
         passed=True,
     )
     validate_proof(preview, proof)
@@ -64,7 +64,7 @@ def test_proof_rejects_new_path_outside_scope():
     proof = make_proof(
         changed_paths=(Path(".claude/hooks/retry.sh"), Path("AGENTS.md")),
         command_output=("updated",),
-        verification_output=("pass",),
+        verification_output=("true :: PASS",),
         passed=True,
     )
     try:
@@ -73,6 +73,123 @@ def test_proof_rejects_new_path_outside_scope():
         assert "AGENTS.md" in str(exc)
     else:
         raise AssertionError("unapproved changed path must fail")
+
+
+def test_proof_rejects_not_ok_even_when_generic_ok_is_present():
+    preview = make_preview()
+    proof = make_proof(
+        changed_paths=(Path("SKILL.md"),),
+        command_output=("ok\nnot ok",),
+        verification_output=("true :: PASS",),
+        passed=True,
+    )
+    try:
+        validate_proof(preview, proof)
+    except ApplyProofError as exc:
+        assert "failure" in str(exc)
+    else:
+        raise AssertionError("explicit not ok status must fail closed")
+
+
+def test_proof_rejects_explicit_failed_verification_status():
+    preview = make_preview()
+    proof = make_proof(
+        changed_paths=(Path("SKILL.md"),),
+        command_output=("ok",),
+        verification_output=("true :: FAIL",),
+        passed=True,
+    )
+    try:
+        validate_proof(preview, proof)
+    except ApplyProofError as exc:
+        assert "failure" in str(exc) or "PASS" in str(exc)
+    else:
+        raise AssertionError("explicit failed verification status must fail")
+
+
+def test_verification_output_covers_each_declared_command_once():
+    request = make_request(
+        verification_commands=("true", "python3 scripts/check_retry.py"),
+    )
+    from apply import build_preview
+
+    preview = build_preview(request, inventory=make_inventory(), workspace=make_workspace())
+    proof = make_proof(
+        changed_paths=(Path("SKILL.md"),),
+        command_output=("changed one file",),
+        verification_output=(
+            "true :: PASS",
+            "python3 scripts/check_retry.py :: PASS",
+        ),
+        passed=True,
+    )
+    validate_proof(preview, proof)
+
+
+def test_verification_output_rejects_missing_declared_command():
+    request = make_request(
+        verification_commands=("true", "python3 scripts/check_retry.py"),
+    )
+    from apply import build_preview
+
+    preview = build_preview(request, inventory=make_inventory(), workspace=make_workspace())
+    proof = make_proof(
+        changed_paths=(Path("SKILL.md"),),
+        command_output=("changed one file",),
+        verification_output=("true :: PASS",),
+        passed=True,
+    )
+    try:
+        validate_proof(preview, proof)
+    except ApplyProofError as exc:
+        assert "missing" in str(exc) or "every" in str(exc)
+    else:
+        raise AssertionError("missing command verification must fail")
+
+
+def test_verification_output_rejects_duplicate_declared_command():
+    request = make_request(
+        verification_commands=("true", "python3 scripts/check_retry.py"),
+    )
+    from apply import build_preview
+
+    preview = build_preview(request, inventory=make_inventory(), workspace=make_workspace())
+    proof = make_proof(
+        changed_paths=(Path("SKILL.md"),),
+        command_output=("changed one file",),
+        verification_output=("true :: PASS", "true :: PASS"),
+        passed=True,
+    )
+    try:
+        validate_proof(preview, proof)
+    except ApplyProofError as exc:
+        assert "duplicate" in str(exc)
+    else:
+        raise AssertionError("duplicate command verification must fail")
+
+
+def test_verification_output_rejects_unknown_declared_command():
+    request = make_request(
+        verification_commands=("true", "python3 scripts/check_retry.py"),
+    )
+    from apply import build_preview
+
+    preview = build_preview(request, inventory=make_inventory(), workspace=make_workspace())
+    proof = make_proof(
+        changed_paths=(Path("SKILL.md"),),
+        command_output=("changed one file",),
+        verification_output=(
+            "true :: PASS",
+            "python3 scripts/other_check.py :: PASS",
+        ),
+        passed=True,
+    )
+    try:
+        validate_proof(preview, proof)
+    except ApplyProofError as exc:
+        assert "not declared" in str(exc)
+    else:
+        raise AssertionError("unknown command verification must fail")
 
 
 def test_two_approved_clusters_with_disjoint_paths_are_independent():
