@@ -5,6 +5,7 @@ import ast
 import json
 import os
 import re
+import stat
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -448,10 +449,13 @@ def _status_update(current: LedgerStatus, update: Any) -> tuple[LedgerStatus | N
     if isinstance(update, tuple) and len(update) == 2:
         requested, verification = update
         if isinstance(requested, (LedgerStatus, str)):
-            target, wired = _status_update(current, requested)
             if verification is not None:
-                target = validate_transition(current, verification)
-            return target, wired
+                try:
+                    LedgerStatus(requested)
+                except ValueError as exc:
+                    raise LedgerTransitionError(f"unknown requested ledger status: {requested!r}") from exc
+                return validate_transition(current, verification), None
+            return _status_update(current, requested)
     raise LedgerTransitionError(f"unsupported ledger update for {current.value}")
 
 
@@ -474,11 +478,13 @@ def _atomic_write(path: Path, text: str) -> None:
     temporary_name: str | None = None
     descriptor: int | None = None
     try:
+        existing_mode = stat.S_IMODE(path.stat().st_mode)
         descriptor, temporary_name = tempfile.mkstemp(
             prefix=f".{path.name}.",
             dir=str(path.parent),
             text=True,
         )
+        os.fchmod(descriptor, existing_mode)
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as stream:
             descriptor = None
             stream.write(text)

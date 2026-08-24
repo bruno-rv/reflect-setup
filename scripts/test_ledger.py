@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Runnable checks for strict ledger parsing and transitions."""
 from pathlib import Path
+import stat
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -135,6 +136,28 @@ def test_operating_state_status_update_requires_verification():
             assert "verification" in str(exc)
         else:
             raise AssertionError("raw operating status update must fail closed")
+
+
+def test_tuple_status_update_uses_verification_for_valid_and_invalid_paths():
+    source = "- id: fixture\n  status: fix-applied\n  wired_check: \"observe\"\n"
+    passing = make_verification("pass", "pass", "pass")
+    updated = update_ledger(source, {"fixture": (LedgerStatus.RESOLVED, passing)})
+    assert "status: resolved" in updated
+
+    recurring = make_verification("fail", "pass", "pass")
+    updated = update_ledger(source, {"fixture": (LedgerStatus.RESOLVED, recurring)})
+    assert "status: built-not-operating" in updated
+
+
+def test_atomic_ledger_update_preserves_existing_file_permissions():
+    source = "- id: fixture\n  status: new\n  wired_check: \"\"\n"
+    with TemporaryDirectory() as raw:
+        path = Path(raw) / "clusters.yaml"
+        path.write_text(source)
+        path.chmod(0o640)
+        before = stat.S_IMODE(path.stat().st_mode)
+        update_ledger(path, {"fixture": LedgerStatus.MONITOR})
+        assert stat.S_IMODE(path.stat().st_mode) == before
 
 
 def test_update_ledger_rejects_untyped_findings_and_evidence():
