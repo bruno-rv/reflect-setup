@@ -21,7 +21,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Mapping
 
-from runtime import Runtime, RuntimeSpec, Scope
+from runtime import Runtime, RuntimeSpec, Scope, subagent_path_excluded
 
 
 USER_TRUNCATE = 500
@@ -555,7 +555,7 @@ def _scan_typed_source(spec, scope, relative_path, path):
     project_match = True
     if spec.runtime is Runtime.CLAUDE:
         project_match = not scope.project_filter or scope.project_filter in source_project
-        canonical = scope.include_subagents or "subagents" not in relative_parts
+        canonical = not subagent_path_excluded(relative_path, scope.include_subagents)
         if not project_match or not canonical:
             signals = []
     else:
@@ -567,6 +567,10 @@ def _scan_typed_source(spec, scope, relative_path, path):
         canonical = metadata_session is not None and (
             bool(metadata_project)
             and (scope.include_subagents or metadata_thread_source == "user")
+        )
+        canonical = canonical and not subagent_path_excluded(
+            relative_path,
+            scope.include_subagents,
         )
         if not project_match or not canonical:
             signals = []

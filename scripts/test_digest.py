@@ -520,6 +520,52 @@ def test_codex_missing_or_invalid_session_metadata_is_recorded_as_incomplete():
                 raise AssertionError("invalid Codex metadata must fail closed")
 
 
+def test_codex_subagents_path_is_filtered_only_when_subagents_are_excluded():
+    with TemporaryDirectory() as raw:
+        root = Path(raw)
+        source_root = root / "sessions"
+        nested = source_root / "subagents"
+        nested.mkdir(parents=True)
+        canonical_line = make_line(
+            {
+                "type": "session_meta",
+                "timestamp": "2026-08-23T09:00:00Z",
+                "payload": {"id": "user-1", "thread_source": "user", "project": "project-a"},
+            }
+        ) + make_line(
+            {
+                "type": "event_msg",
+                "timestamp": "2026-08-23T10:00:00Z",
+                "payload": {"type": "user_message", "message": "canonical user"},
+            }
+        )
+        subagent_line = canonical_line.replace("user-1", "nested-user-1").replace(
+            "canonical user", "nested path user"
+        )
+        (source_root / "canonical.jsonl").write_text(canonical_line)
+        (nested / "foo.jsonl").write_text(subagent_line)
+        spec = resolve_runtime("codex", home=root, env={}, source_root=source_root)
+
+        default = run_digest(
+            spec,
+            Scope(datetime(2026, 8, 23, tzinfo=timezone.utc), None, False),
+            root / "default-out",
+        )
+        assert default.sessions_scanned == 2
+        assert default.sessions_with_signals == 1
+        assert default.source_files[1].source_path == "subagents/foo.jsonl"
+        assert default.source_files[1].digest_path is None
+
+        included = run_digest(
+            spec,
+            Scope(datetime(2026, 8, 23, tzinfo=timezone.utc), None, True),
+            root / "included-out",
+        )
+        assert included.sessions_scanned == 2
+        assert included.sessions_with_signals == 2
+        assert included.source_files[1].digest_path is not None
+
+
 def test_end_to_end_writes_digest_and_skips_empty_and_memory():
     tmp = tempfile.mkdtemp()
     try:

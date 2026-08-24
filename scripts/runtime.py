@@ -162,9 +162,14 @@ def _project_filter_matches(project: str, scope: Scope) -> bool:
     return not scope.project_filter or scope.project_filter in project
 
 
+def subagent_path_excluded(relative_path: str, include_subagents: bool) -> bool:
+    """Return whether a path-component marks an intentionally excluded subagent."""
+    return not include_subagents and "subagents" in Path(relative_path).parts
+
+
 def _skip_subagent_path(relative_path: str, scope: Scope) -> bool:
     parts = Path(relative_path).parts
-    return "memory" in parts or (not scope.include_subagents and "subagents" in parts)
+    return "memory" in parts or subagent_path_excluded(relative_path, scope.include_subagents)
 
 
 def _read_codex_metadata(path: Path) -> dict | None:

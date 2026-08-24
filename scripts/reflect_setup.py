@@ -43,7 +43,14 @@ from miner_contract import (
     parse_report,
     merge_reports,
 )
-from runtime import Runtime, RuntimeSpec, Scope, discover_sessions, resolve_runtime
+from runtime import (
+    Runtime,
+    RuntimeSpec,
+    Scope,
+    discover_sessions,
+    resolve_runtime,
+    subagent_path_excluded,
+)
 from scoring import CandidateScore, compute_metrics, rank_candidates, score_candidate
 from verification import FixVerification, verify_fix
 
@@ -115,11 +122,11 @@ def _manifest_session_paths(manifest: DigestManifest) -> frozenset[str]:
     for source in manifest.source_files:
         if not source.scanned:
             continue
-        relative = Path(source.source_path)
-        if manifest.runtime is Runtime.CLAUDE:
-            if not manifest.scope.include_subagents and "subagents" in relative.parts:
-                continue
-        elif not manifest.scope.include_subagents and source.thread_source != "user":
+        if subagent_path_excluded(source.source_path, manifest.scope.include_subagents):
+            continue
+        if manifest.runtime is Runtime.CODEX and (
+            not manifest.scope.include_subagents and source.thread_source != "user"
+        ):
             continue
         if manifest.scope.project_filter and (
             not source.project or manifest.scope.project_filter not in source.project

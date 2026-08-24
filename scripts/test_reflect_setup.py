@@ -157,8 +157,8 @@ def test_reflection_continuation_validates_reports_and_writes_ranked_report():
 
 def test_codex_continuation_matches_canonical_session_scope_with_subagents():
     for include_subagents, expected_paths in (
-        (False, ("canonical.jsonl", "subagent.jsonl")),
-        (True, ("canonical.jsonl", "subagent.jsonl")),
+        (False, ("canonical.jsonl", "subagents/subagent.jsonl")),
+        (True, ("canonical.jsonl", "subagents/subagent.jsonl")),
     ):
         with TemporaryDirectory() as raw:
             root = Path(raw)
@@ -169,9 +169,11 @@ def test_codex_continuation_matches_canonical_session_scope_with_subagents():
                 '"payload":{"id":"canonical-1","thread_source":"user",'
                 '"cwd":"/tmp/project-a"}}\n'
             )
-            (source_root / "subagent.jsonl").write_text(
+            nested = source_root / "subagents"
+            nested.mkdir()
+            (nested / "subagent.jsonl").write_text(
                 '{"type":"session_meta","timestamp":"2026-08-23T10:00:00Z",'
-                '"payload":{"id":"subagent-1","thread_source":"subagent",'
+                '"payload":{"id":"subagent-1","thread_source":"user",'
                 '"cwd":"/tmp/project-a"}}\n'
             )
             kwargs = dict(
