@@ -17,22 +17,30 @@ JSON object below.
 Interrupt markers are context for `failure` or `friction`; they are not a
 standalone finding type.
 
-Each retained signal line has labeled digest-visible metadata in this stable
-shape:
+Each retained signal is one compact JSON object on exactly one physical line.
+It has this stable shape (key order is canonical and values are JSON-escaped):
 
-```text
-- source_line=7 timestamp=2026-08-23T10:00:00Z kind=user project=project-a session_id=session-a :: signal text
+```json
+{"project":"project-a","session_id":"session-a","source_kind":"user","source_line":7,"text":"signal text","timestamp":"2026-08-23T10:00:00Z"}
 ```
 
 `source_line` is the original JSONL source line, not the line number of the
-rendered digest file. Copy it exactly; never substitute the digest-local line
-number or invent a value. The `timestamp`, `kind`, `project`, and `session_id`
-labels are the signal's identity and must remain consistent with the cited
-evidence.
+rendered digest file. `source_kind` is the runtime extraction kind (`user`,
+`error`, or `interrupt`); it is not a miner classification. Copy source
+metadata exactly; never substitute the digest-local line number or invent a
+value. JSON escaping keeps project, session, and text values—including spaces,
+quotes, backslashes, and newlines—unambiguous and on one physical line.
 
-Only digest lines with `kind=user` or `kind=error` are signal candidates.
-Discount skill-listing boilerplate, background-agent notifications, and any
-text that looks like source code or raw file contents.
+Records with `source_kind=user` or `source_kind=error` are signal candidates.
+`source_kind=interrupt` is context for `friction` or `failure`, never a
+standalone finding. Discount skill-listing boilerplate, background-agent
+notifications, and any text that looks like source code or raw file contents.
+
+Classify each candidate independently. `finding_type` and evidence `kind` are
+the selected miner classification (`correction`, `friction`, `failure`, or
+`complaint`), not the raw `source_kind`. For example, a `source_kind=user`
+record may be classified as `failure`, so the report keeps
+`evidence.kind: "failure"` while copying the record's source metadata fields.
 
 ## Assigned batch
 
@@ -83,6 +91,8 @@ Rules for the fields:
   non-empty strings. `digest_paths` must exactly equal the assigned list.
 - `finding_type` and evidence `kind` are one of `correction`, `friction`,
   `failure`, or `complaint`; evidence `kind` must match its finding type.
+  These are miner classifications and must not copy the digest record's
+  `source_kind` (`user`, `error`, or `interrupt`).
 - Each finding has exactly `cluster_key`, `finding_type`, `session_id`,
   `paraphrase`, `occurrence_count`, `confidence`, and `evidence` fields. Each
   evidence item has exactly `digest_path`, `project`, `source_line`,
@@ -98,10 +108,11 @@ Rules for the fields:
 - Each evidence reference names an assigned digest path, uses a positive
   digest `source_line`, and includes an RFC 3339 timestamp with timezone.
   Evidence is typed, has a positive `occurrence_count`, and must point to the
-  signal supporting that finding. Copy `source_line`, timestamp, kind, and
-  project exactly from the labeled digest metadata and verify them against the
-  manifest evidence index; do not invent metadata or use a digest-local line
-  number. Copy the digest `session_id` into the finding's `session_id`.
+  signal supporting that finding. Copy `source_line`, timestamp, project, and
+  session_id exactly from the digest JSON record and verify them against the
+  manifest evidence index. Choose evidence `kind` from the selected
+  `finding_type`; do not copy `source_kind`, invent metadata, or use a
+  digest-local line number.
   Every cited index entry must belong to the finding's `session_id`, and a
   finding must not mix sessions.
 - `themes` is an array of zero, one, or two short strings. Do not include more

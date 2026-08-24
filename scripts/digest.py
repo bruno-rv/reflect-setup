@@ -437,10 +437,20 @@ def _write_typed_digest(
     lines = [f"# {session_id}\n", f"# project: {project}\n", "\n"]
     for signal in signals:
         lines.append(
-            f"- source_line={signal.source_line} "
-            f"timestamp={_signal_timestamp(signal.timestamp)} "
-            f"kind={signal.kind.value} project={project} "
-            f"session_id={signal.session_id} :: {signal.text}\n"
+            json.dumps(
+                {
+                    "source_line": signal.source_line,
+                    "timestamp": _signal_timestamp(signal.timestamp),
+                    "source_kind": signal.kind.value,
+                    "project": project,
+                    "session_id": signal.session_id,
+                    "text": signal.text,
+                },
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n"
         )
     _atomic_write(path, "".join(lines))
     return str(path)

@@ -116,14 +116,20 @@ bytes, deleted files, path escapes, or tampered manifest metadata fail closed.
 Each retained signal in a digest carries its source identity directly on the
 rendered line:
 
-```text
-- source_line=7 timestamp=2026-08-23T10:00:00Z kind=user project=project-a session_id=session-a :: signal text
+```json
+{"project":"project-a","session_id":"session-a","source_kind":"user","source_line":7,"text":"signal text","timestamp":"2026-08-23T10:00:00Z"}
 ```
 
 `source_line` always means the original JSONL line. It is not the rendered
-digest's local line number. Miners must copy `source_line`, `timestamp`,
-`kind`, `project`, and `session_id` from these labeled fields, then use the
-manifest evidence index as the validation check before returning a report.
+digest's local line number. Each signal record is one physical line and JSON
+escaping preserves arbitrary project, session, and text values. `source_kind`
+is the runtime extraction kind (`user`, `error`, or `interrupt`). The miner's
+`finding_type` and report evidence `kind` are separate classifications
+(`correction`, `friction`, `failure`, or `complaint`); evidence `kind` must match
+the selected `finding_type`, not copy `source_kind`. Miners must copy
+`source_line`, `timestamp`, `project`, and `session_id` from the JSON record,
+then use the manifest evidence index as the validation check before returning a
+report. The manifest index's persisted `kind` field is this source kind.
 
 ## Miner contract and batches
 

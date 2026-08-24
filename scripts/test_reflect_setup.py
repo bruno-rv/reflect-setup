@@ -87,13 +87,12 @@ def test_end_to_end_honest_digest_evidence_passes_and_digest_local_line_fails():
         source_entry = manifest["source_files"][0]
         digest_path = Path(source_entry["digest_path"])
         signal_lines = [
-            (index, line)
+            (index, json.loads(line))
             for index, line in enumerate(digest_path.read_text().splitlines(), 1)
-            if line.startswith("- ")
+            if line.startswith("{")
         ]
-        local_line, rendered = signal_lines[0]
-        fields, _ = rendered[2:].split(" :: ", 1)
-        visible = dict(field.split("=", 1) for field in fields.split())
+        local_line, visible = signal_lines[0]
+        assert visible["source_kind"] == "user"
         honest = {
             "schema_version": 1,
             "runtime": "claude",
@@ -111,7 +110,7 @@ def test_end_to_end_honest_digest_evidence_passes_and_digest_local_line_fails():
                     "evidence": [
                         {
                             "digest_path": source_entry["digest_path"],
-                            "source_line": int(visible["source_line"]),
+                            "source_line": visible["source_line"],
                             "timestamp": visible["timestamp"],
                             "kind": "failure",
                             "project": visible["project"],

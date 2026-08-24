@@ -182,10 +182,12 @@ def test_manifest_indexes_each_retained_signal_with_source_truth():
         ]
 
 
-def test_typed_digest_exposes_source_line_and_signal_identity():
+def test_typed_digest_json_record_round_trips_source_identity_and_text():
     with TemporaryDirectory() as raw:
         root = Path(raw)
-        source_root = root / "projects" / "project-a"
+        project = 'project with "quotes" \\ backslashes'
+        session = 'session with "quotes" \\ backslashes'
+        source_root = root / "projects" / project
         source_root.mkdir(parents=True)
         lines = [
             make_line(
@@ -205,11 +207,14 @@ def test_typed_digest_exposes_source_line_and_signal_identity():
                 {
                     "type": "user",
                     "timestamp": "2026-08-23T10:06:00Z",
-                    "message": {"role": "user", "content": "please fix this"},
+                    "message": {
+                        "role": "user",
+                        "content": 'line one\nline "two" \\ backslash',
+                    },
                 }
             )
         )
-        (source_root / "session.jsonl").write_text("".join(lines))
+        (source_root / f"{session}.jsonl").write_text("".join(lines))
         spec = resolve_runtime("claude", home=root, env={}, source_root=source_root.parent)
         manifest = run_digest(
             spec,
@@ -217,19 +222,73 @@ def test_typed_digest_exposes_source_line_and_signal_identity():
             root / "out",
         )
         digest_path = Path(manifest.source_files[0].digest_path)
-        signal_line = next(
-            line for line in digest_path.read_text().splitlines() if line.startswith("- ")
-        )
-        fields, text = signal_line[2:].split(" :: ", 1)
-        visible = dict(field.split("=", 1) for field in fields.split())
-        assert visible == {
-            "source_line": "7",
+        signal_lines = [
+            (index, line)
+            for index, line in enumerate(digest_path.read_text().splitlines(), 1)
+            if line.startswith("{")
+        ]
+        assert len(signal_lines) == 1
+        local_line, signal_line = signal_lines[0]
+        record = json.loads(signal_line)
+        assert record == {
+            "source_line": 7,
             "timestamp": "2026-08-23T10:06:00Z",
-            "kind": "user",
-            "project": "project-a",
-            "session_id": "session",
+            "source_kind": "user",
+            "project": project,
+            "session_id": session,
+            "text": 'line one\nline "two" \\ backslash',
         }
-        assert text == "please fix this"
+        assert local_line != record["source_line"]
+        assert "\n" not in signal_line
+        assert "\\n" in signal_line
+
+
+def test_miner_contract_maps_source_kind_to_classified_evidence_kind():
+    from miner_contract import parse_report
+    from test_support import make_batch, make_manifest
+
+    manifest = make_manifest(
+        run_id="run-1",
+        files=("project__session-a--abc.md",),
+        lines=(("project__session-a--abc.md", 4, "2026-08-23T10:00:00Z", "user"),),
+        project="project-a",
+    )
+    batch = make_batch("batch-1", ("project__session-a--abc.md",))
+    report = parse_report(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "runtime": "claude",
+                "run_id": "run-1",
+                "batch_id": "batch-1",
+                "digest_paths": ["project__session-a--abc.md"],
+                "findings": [
+                    {
+                        "cluster_key": "classified-user-correction",
+                        "finding_type": "failure",
+                        "session_id": "session-a",
+                        "paraphrase": "A user signal was classified as a failure.",
+                        "occurrence_count": 1,
+                        "confidence": 0.9,
+                        "evidence": [
+                            {
+                                "digest_path": "project__session-a--abc.md",
+                                "project": "project-a",
+                                "source_line": 4,
+                                "timestamp": "2026-08-23T10:00:00Z",
+                                "kind": "failure",
+                            }
+                        ],
+                    }
+                ],
+                "themes": [],
+            }
+        ),
+        manifest,
+        batch,
+    )
+    assert manifest.source_files[0].evidence_index[0].kind.value == "user"
+    assert report.findings[0].evidence[0].kind.value == "failure"
 
 
 def test_old_event_is_excluded_from_recent_file_and_output_is_collision_free():
