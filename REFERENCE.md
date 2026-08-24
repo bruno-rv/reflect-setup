@@ -1,152 +1,182 @@
 # reflect-setup — Reference
 
-Full detail behind each `SKILL.md` workflow step. This file links nowhere deeper — it and
-`references/miner-prompt.md` are the only two hops from `SKILL.md`.
+This is the runtime-neutral operator contract behind `SKILL.md`. The Python
+core uses only the standard library and writes a manifest before it accepts any
+miner output.
+
+## Runtime table
+
+| Concern | Claude Code | Codex | Shared rule |
+| --- | --- | --- | --- |
+| Sessions | `~/.claude/projects/` | `~/.codex/sessions/` | `--source-root` overrides the default |
+| Canonical scope | Project JSONL; `subagents/` excluded | `session_meta.payload.thread_source == "user"` | `--include-subagents` opts in |
+| Inventory | skills, commands, agents, settings | skills, agents, `config.toml` | declaration is separate from operation |
+| Skill root | `~/.claude/skills/reflect-setup` | `~/.codex/skills/reflect-setup` | one checkout may be installed into both |
+
+`--runtime auto` selects one readable root. If both or neither are available,
+the command fails and asks for an explicit runtime.
 
 ## Scope
 
-Parse `$ARGUMENTS` for an optional day window (default: **last 30 days**; an explicit window in
-`$ARGUMENTS` overrides this) and an optional project-path filter. The last-run date in
-`reflection-notes.md`, if present, is still used for the "Since last run" comparison in the notes
-step — it just no longer sets the mining window itself. State the resolved scope at the top of
-your output.
+`--since DAYS` means a UTC cutoff of `now - DAYS`. The direct host command
+accepts `/reflect-setup [days] [project-filter]`; the Python CLI accepts
+`--since`, `--project-filter`, and `--include-subagents`. Event timestamps in
+each JSONL record determine inclusion. Filesystem mtime may order work but can
+never include or exclude a session. Events exactly at the cutoff are included.
 
-## Inventory
+Only canonical user-originated records are signal candidates by default.
+Assistant prose, developer messages, successful tool output containing source
+code errors, and subagent/sidechain records are not user signals.
 
-Before mining anything, catalog current coverage so you never propose something that's already
-built:
+## Inventory and coverage
 
-- Skills: `~/.claude/skills/*/SKILL.md`, `.claude/skills/*/SKILL.md`
-- Commands (legacy): `~/.claude/commands/*.md`, `.claude/commands/*.md`
-- Subagents: `.claude/agents/*.md`
-- Hooks and permission rules: `.claude/settings.json`, `.claude/settings.local.json`
+Inventory records `InventoryItem` declarations from runtime-specific roots.
+Each `CoverageRecord` keeps these states independent:
 
-Keep this as a lookup table for the decide step.
+- `declared`: an artifact exists in an inventory location;
+- `eligible`: runtime trigger and scope rules select it;
+- `triggered`: transcript/tool evidence shows it loaded or ran;
+- `prevented`: independent behavioral evidence proves the symptom did not recur;
+  `false` means recurrence and `null` means insufficient outcome evidence.
 
-## Digest
+An existing `SKILL.md`, command, hook, or config file is never treated as proof
+that the artifact operated.
 
-`scripts/digest.py` (repo root of this skill, `scripts/` subdir) deterministically streams every
-in-scope session `.jsonl` line-by-line and keeps only user-role text, `is_error:true` tool
-results, and interrupt markers, so no subagent ever has to stream raw multi-MB transcripts itself
-or risk matching noise inside file-read content.
-
-### CLI usage
+## Digest and manifest
 
 ```bash
-python3 scripts/digest.py --projects-dir ~/.claude/projects --since <days> --out <scratch-dir> [--project-filter <substr>]
+PYTHONPATH=scripts python3 scripts/reflect_setup.py \
+  --runtime claude --since 30 --out .reflect-setup-run
 ```
 
-### Flags
+`run_digest()` requires a new or empty output directory, emits collision-free
+digest names and `manifest.json`, and records every scanned source, readability,
+malformed/untimestamped line counts, project identity, and digest path. A
+malformed or unreadable source produces `complete: false`, persists the
+manifest, and exits nonzero with `IncompleteDigestError`; miners are not
+dispatched. A non-empty output directory without a persisted manifest is
+rejected rather than reused.
 
-| Flag | Required | Default | Meaning |
-|---|---|---|---|
-| `--projects-dir` | yes | — | Root to scan, e.g. `~/.claude/projects` |
-| `--since` | no | `30` | Days back from now |
-| `--out` | yes | — | Directory to write digest `.md` files into |
-| `--project-filter` | no | none | Substring match on project dir name |
+When the first phase stops because reports are not yet available, host miners
+may run over the persisted digest files. A later invocation with the same run
+directory reuses its complete manifest and validates reports against it.
 
-Any directory literally named `memory` is skipped entirely (never descended into) — it holds
-auto-memory, not session transcripts. Read the stdout summary line for a sanity count (sessions
-scanned, sessions with signal, per-type totals) before proceeding to mining.
+## Miner contract and batches
 
-## Mining
+Every report is one JSON object with exactly these top-level fields:
 
-Partition the resulting digest files in `<scratch-dir>` into batches (by week, or by a fixed file
-count — pick whichever keeps each subagent's context manageable; a few dozen digest files per
-batch is a reasonable starting point, fewer if individual sessions are signal-heavy) and dispatch
-one subagent per batch via the Task tool. Each miner subagent uses the canonical prompt at
-`references/miner-prompt.md` in this skill directory, filled in with its digest batch — it
-extracts only the signal types and false-positive rules defined there (correction / friction /
-failure / complaint), each tagged with session basename, timestamp, and a short paraphrase (never
-verbatim sensitive content). Dispatch batches in parallel; there is no dependency between them.
-
-## Clustering
-
-In the main agent, merge subagent outputs into clusters by underlying cause (not surface wording).
-For each cluster, record: session list, per-session count, first-seen date, last-seen date.
-
-## Decision thresholds
-
-For each cluster, cross-check against the inventory step, then decide using explicit thresholds:
-
-| Recurrence | Nature of the fix | Verdict |
-|---|---|---|
-| ≥3 sessions across ≥2 distinct days | Same repeated task/workflow | **New skill** — only if no existing skill covers it |
-| ≥3 sessions | Mechanical, deterministic (formatting, repeated bash sequence) | **Automation** (hook or script) |
-| Any recurrence | One-line CLAUDE.md rule, config tweak, or permission entry | **Fix** |
-| 1–2 sessions, or already covered by an existing skill/command | — | **Nothing** — note why, so it doesn't get re-proposed next run |
-
-Never propose a skill for something that hasn't recurred, even if it looks high-value.
-
-## Fix-wiring verification
-
-For every entry in the local `clusters.yaml` ledger with `status: fix-applied`, check this
-window's digests for evidence the fix actually **operates**, per that entry's `wired_check` (e.g.
-"digests contain zero 'is the shell stuck' user messages," or "recording_health.py appears
-invoked in digests, not just present in the repo"). A fix that never ran, or whose symptom
-recurred anyway, gets flagged **built-not-operating** in the notes and re-ranked — built code is
-not the same claim as an operating fix.
-
-### Ledger schema and status semantics
-
-Schema: `clusters.example.yaml`. Each entry has an `id` (kebab-slug), `status`, `sessions`,
-`last_seen`, and (once a fix is applied) a `wired_check`.
-
-Status values:
-
-- `new` — just clustered this run, not yet decided or acted on.
-- `fix-applied` — Apply phase dispatched a fixer and it returned proof; the *next* run's
-  fix-wiring verification is what turns this into `resolved`. Applying is not the same claim as
-  operating.
-- `built-not-operating` — verification found the fix was applied but never actually ran, or its
-  symptom recurred anyway. Re-ranked, not silently dropped.
-- `resolved` — a fix-wiring verification pass found explicit non-recurrence evidence in-window.
-  Never set `resolved` merely because no new evidence was mined that run (absence of evidence is
-  not evidence of absence); it requires the digests to positively show the symptom is gone.
-
-Update `clusters.yaml` for every touched entry: bump `last_seen` and `sessions` for anything still
-recurring, and move `status` to `resolved` only under the rule above. New clusters from the decide
-step get a fresh ledger `id` and `status: new`.
-
-## Notes format
-
-Append (don't overwrite) a dated section to `reflection-notes.md`, ranked most-leverage-first.
-Each cluster heading carries its `clusters.yaml` ledger id so notes and ledger stay
-cross-referenced:
-
-```markdown
-## Run: 2026-07-10 (scope: last 21 days, all projects)
-
-### 1. [Cluster name] (`ledger-id`) — New skill — HIGH
-- Recurrence: 5 sessions / 8 occurrences (2026-06-22 → 2026-07-09)
-- Evidence: session_abc.jsonl, session_def.jsonl, ... (link or path)
-- Build cost: S (single SKILL.md, no new tools)
-- Rationale: ...
-- Status: new
-
-### 2. ...
+```json
+{
+  "schema_version": 1,
+  "runtime": "claude",
+  "run_id": "manifest-run-id",
+  "batch_id": "batch-a",
+  "digest_paths": ["/path/to/digest.md"],
+  "findings": [],
+  "themes": []
+}
 ```
 
-At the end, add a **Since last run** subsection: what's resolved (no longer recurring), what's
-still open, what's newly recurring, and any **built-not-operating** flags from the fix-wiring
-verification step.
+Each finding has `cluster_key`, `finding_type` (`correction`, `friction`,
+`failure`, or `complaint`), `session_id`, one-line `paraphrase`, positive
+`occurrence_count`, confidence in `[0,1]`, and typed evidence. Each evidence
+reference includes `digest_path`, positive `source_line`, RFC3339 `timestamp`,
+matching `kind`, and explicit `project` identity.
 
-## Apply phase
+The report's ordered `digest_paths` must equal its assigned `BatchSpec`. Across
+all reports, each non-empty manifest digest path must occur in exactly one
+batch. Unknown, overlapping, missing, malformed, or out-of-batch evidence
+fails closed before clustering. An empty manifest has no miner work and accepts
+an empty report set.
 
-Diagnosis-only governs every step above; this phase only runs if the user opts in, and never runs
-unasked.
+## Clustering and verification
 
-After writing `reflection-notes.md`, use `AskUserQuestion` to ask whether to apply the actionable
-fixes from this run. If yes:
+Validated reports merge only true duplicates sharing normalized cluster,
+finding type, and session. Evidence identity remains `(digest_path, source_line)`
+and project identity is never inferred from filenames.
 
-1. Dispatch one fixer subagent per actionable cluster, in parallel (independent clusters, no
-   shared state).
-2. Require each fixer to return **proof** — actual command output, not a claim — that its fix
-   works.
-3. Append an "Applied `<date>`" addendum to `reflection-notes.md` summarizing what each fixer did.
-4. Set the corresponding `clusters.yaml` entries to `status: fix-applied` with a `wired_check`
-   defined for each — the next run's fix-wiring verification step is what turns "applied" into
-   "verified operating."
+For each touched ledger entry with a non-empty `wired_check`, evaluate three
+independent checks:
 
-Pairs well with a monthly `/schedule` routine that runs this skill unattended and surfaces the
-notes.
+1. **Symptom** — explicit `symptom-absent` passes; current recurrence fails.
+2. **Invocation** — `invoked` proves the artifact was loaded/called.
+3. **Outcome** — a separate `outcome-pass` proves successful behavior;
+   `outcome-fail` fails. Reusing invocation evidence cannot pass outcome.
+
+`fix-applied` or `built-not-operating` becomes `resolved` only when all three
+pass. Missing evidence leaves it unresolved; recurrence or failed invocation/
+outcome recommends `built-not-operating`. A resolved entry regresses when its
+symptom recurs. The ledger statuses are `new`, `fix-applied`,
+`built-not-operating`, `monitor`, `wont-fix`, and `resolved`.
+
+## Ranking
+
+For each cluster, expose occurrences, sessions, projects, distinct days,
+analyzed sessions, first/last seen, occurrences per 100 sessions, regression
+count, confidence, impact, and implementation cost (`S`, `M`, `L`). The fixed
+score is:
+
+```text
+round(
+  0.30 * min(occurrences / 10, 1.0)
++ 0.20 * min(sessions / 5, 1.0)
++ 0.15 * min(projects / 3, 1.0)
++ 0.15 * min(distinct_days / 5, 1.0)
++ 0.10 * confidence
++ 0.10 * impact
+- 0.10 * min(regression_count / max(occurrences, 1), 1.0),
+  4,
+)
+```
+
+Impact is fixed by finding type: failure `1.0`, complaint `0.9`, correction
+`0.8`, friction `0.7`; mixed clusters use the average. Ties sort by score
+descending, regression count ascending, first-seen date, implementation cost,
+then cluster key.
+
+## Report output
+
+The orchestrator writes `reflection-report.json` atomically beside the digest
+manifest. It includes the manifest, runtime inventory, coverage records,
+verification results, ranked candidates, and Apply approval metadata. The report
+is not a substitute for host notes or ledger updates and is never written when
+the digest is incomplete.
+
+## Apply
+
+Apply is opt-in and per cluster. `--apply` without repeated
+`--approve-cluster ID` flags fails before fixer work. The host displays a
+preview containing the project-relative target paths, dirty baseline, commands,
+and verification commands. `scripts/apply.py` rejects path escapes, unresolved
+workspace conflicts, overlapping parallel scopes, duplicate commands, and
+unapproved new paths.
+
+Fixers must return non-empty output and `passed=True`. Every declared
+verification command must appear exactly once as the byte-exact record:
+
+```text
+<declared command> :: PASS
+```
+
+Any explicit failure status, missing/unknown/non-PASS record, or failed command
+invalidates the proof. Python does not execute host task/fixer commands; the
+Claude or Codex workflow owns dispatch and shows the resulting diff and proof
+before updating the ledger.
+
+## Direct checks
+
+Run the focused suites with the repository's explicit import path:
+
+```bash
+PYTHONPATH=scripts python3 scripts/test_runtime.py
+PYTHONPATH=scripts python3 scripts/test_install.py
+PYTHONPATH=scripts python3 scripts/test_digest.py
+PYTHONPATH=scripts python3 scripts/test_miner_contract.py
+PYTHONPATH=scripts python3 scripts/test_coverage_model.py
+PYTHONPATH=scripts python3 scripts/test_ledger.py
+PYTHONPATH=scripts python3 scripts/test_verification.py
+PYTHONPATH=scripts python3 scripts/test_scoring.py
+PYTHONPATH=scripts python3 scripts/test_apply.py
+PYTHONPATH=scripts python3 scripts/test_evaluate.py
+PYTHONPATH=scripts python3 scripts/test_reflect_setup.py
+```

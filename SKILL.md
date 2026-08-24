@@ -1,48 +1,69 @@
 ---
 name: reflect-setup
-description: Diagnostic-only scan of .claude/projects/ session transcripts to find recurring friction and rank improvement candidates (skill / automation / fix / nothing) with cited evidence. Use when the user wants a periodic audit of their Claude Code setup based on how they actually work — a recurring friction and session-transcript scan, not a config-hygiene pass.
+description: Diagnostic-only, dual-runtime scan of Claude Code or Codex session transcripts to find recurring friction and rank improvement candidates with cited evidence.
 argument-hint: [days-back] [project-filter]
 allowed-tools: Read, Grep, Glob, Bash, Task, Write, AskUserQuestion
 ---
 
 # Reflect on Setup
 
-This is **diagnosis-only** through step 8 — never edit, delete, or "helpfully fix" anything until
-the optional Apply phase (opt-in only, never runs unasked). The only files written during
-diagnosis are `reflection-notes.md` and the local `clusters.yaml` ledger, plus throwaway scratch
-digests. If a fix seems obvious before Apply, propose it in the notes — do not apply it.
+`reflect-setup` is diagnosis-only through step 8. It never edits a project or
+dispatches a fixer unless the user explicitly approves an Apply preview in
+step 9. The same checkout supports Claude Code and Codex; the host workflow
+chooses the host task tool, while the Python core remains runtime-neutral.
 
 ## Quick start
 
-Run `/reflect-setup` (optionally `[days-back] [project-filter]`, default **last 30 days**, all
-projects). It scopes the window, inventories what already exists, digests + mines session
-transcripts, clusters findings, verifies fix-wiring, decides per cluster, and appends a dated
-section to `reflection-notes.md`. Full detail on every step: `REFERENCE.md`.
+Run `/reflect-setup` (optionally `[days-back] [project-filter]`, default **last
+30 days**, all projects). Choose the runtime explicitly when both session roots
+exist. The detailed operator contract is in `REFERENCE.md`.
 
 ## Workflow
 
-1. **Scope** — parse `$ARGUMENTS` for a day window (default 30) and project filter; state the
-   resolved scope. [Detail](REFERENCE.md#scope)
-2. **Inventory** — catalog existing skills, commands, subagents, hooks/permissions so nothing gets
-   re-proposed. [Detail](REFERENCE.md#inventory)
-3. **Digest** — run `scripts/digest.py` to pre-extract user text, errors, and interrupts from
-   session `.jsonl` files into a scratch dir. [Detail](REFERENCE.md#digest)
-4. **Mine** — dispatch one subagent per digest batch using `references/miner-prompt.md`.
-   [Detail](REFERENCE.md#mining)
-5. **Cluster** — merge miner outputs by underlying cause, with session list, counts, and dates.
-   [Detail](REFERENCE.md#clustering)
-6. **Fix-wiring verification** — check `clusters.yaml` entries with `status: fix-applied` for
-   proof the fix operates; flag **built-not-operating** if not. [Detail](REFERENCE.md#fix-wiring-verification)
-7. **Decide** — apply the recurrence/nature thresholds per cluster (new skill / automation / fix /
-   nothing). [Detail](REFERENCE.md#decision-thresholds)
-8. **Write notes** — append a dated, ranked section to `reflection-notes.md` plus a "Since last
-   run" summary. [Detail](REFERENCE.md#notes-format)
-9. **Apply (optional, opt-in)** — ask via `AskUserQuestion`; if yes, dispatch parallel fixers, each
-   required to return proof-of-fix. [Detail](REFERENCE.md#apply-phase)
+1. **Scope** — resolve `--runtime auto|claude|codex`, the UTC event-time window,
+   project filter, and subagent inclusion. [Detail](REFERENCE.md#scope)
+2. **Inventory** — record declared skills, commands, agents, hooks, and
+   configuration for the selected host; declaration is not operation.
+   [Detail](REFERENCE.md#inventory)
+3. **Digest** — run `scripts/reflect_setup.py`/`scripts/digest.py` into a new
+   scratch directory. The manifest records every candidate source and fails
+   closed on malformed or unreadable input. [Detail](REFERENCE.md#digest)
+4. **Mine** — partition non-empty digest paths into disjoint batches and dispatch
+   one host miner per batch using `references/miner-prompt.md`. Miners return
+   JSON only; resume the run with `--miner-report` paths. [Detail](REFERENCE.md#miner-contract-and-batches)
+5. **Cluster** — validate every report against the manifest, require exact
+   batch coverage, and merge findings by cause while preserving session,
+   finding type, project, and evidence identity. [Detail](REFERENCE.md#clustering-and-verification)
+6. **Verify wiring** — evaluate symptom, invocation, and independent behavioral
+   outcome checks for touched ledger entries. Missing evidence never resolves a
+   fix; recurrence produces `built-not-operating`. [Detail](REFERENCE.md#clustering-and-verification)
+7. **Rank** — calculate normalized trend metrics and the deterministic candidate
+   score, including recurrence, sessions, projects, days, confidence, impact,
+   regressions, and implementation cost. [Detail](REFERENCE.md#ranking)
+8. **Write report/notes** — write the atomic `reflection-report.json` and append
+   the host's local notes/ledger updates. Diagnosis does not mutate project
+   files. [Detail](REFERENCE.md#report-output)
+9. **Apply (optional, opt-in)** — ask for approval per selected cluster, build a
+   bounded preview, dispatch the host fixer, and require exact command plus
+   verification proof before any ledger transition. [Detail](REFERENCE.md#apply)
+
+## CLI
+
+```bash
+PYTHONPATH=scripts python3 scripts/reflect_setup.py \
+  --runtime auto --since 30 --out .reflect-setup-run
+```
+
+Use `--miner-report PATH` once each host miner has returned its JSON report.
+Use `--include-subagents` only when sidechain material is intentionally in
+scope. `--apply` requires one or more repeated `--approve-cluster ID` flags;
+the Python core never guesses or invokes a Claude/Codex task tool.
 
 ## Hard constraints
 
-- Diagnosis-only through step 8: no edits/fixes anywhere until Apply, and Apply never runs unasked.
-- Only writes `reflection-notes.md` and `clusters.yaml` (plus scratch digests) — nothing else.
-- Default window is **30 days**; an explicit window in `$ARGUMENTS` overrides it, but the ledger's
-  last-run date still drives the "Since last run" comparison in step 8.
+- Runtime selection is explicit when auto-detection is ambiguous.
+- Event timestamps, not filesystem mtimes, determine scope.
+- A partial manifest or incomplete batch cannot be reported as complete.
+- Diagnosis writes only the local manifest, scratch digests, report, notes, and
+  ledger; Apply is never implicit.
+- No privacy, redaction, or retention behavior is added by this skill.
