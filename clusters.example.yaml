@@ -6,12 +6,15 @@
 #   id           kebab-slug, stable across runs (never renamed once evidence
 #                references it)
 #   title        short human label
-#   status       new | fix-applied | monitor | wont-fix | resolved
+#   status       new | fix-applied | built-not-operating | monitor | wont-fix | resolved
 #                  - new: just clustered, no fix decided/applied yet
 #                  - fix-applied: a fix was applied -- NOT proof it operates.
 #                    Use this by default after "Applied <date>" work; only
 #                    move to resolved once a later run's digests show the
 #                    wired_check actually holds.
+#                  - built-not-operating: the fix exists, but invocation is
+#                    missing or the symptom recurred; move to resolved only
+#                    after all three checks pass in a later run.
 #                  - monitor: recurrence too low to act on, or already
 #                    covered and just being watched
 #                  - wont-fix: decided against, with rationale
