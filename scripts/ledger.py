@@ -246,12 +246,14 @@ def _validate_fields(fields: Mapping[str, tuple[int, Any, str]], entry_index: in
         ):
             raise LedgerParseError(f"{prefix} {key} must be a bracketed string list")
     artifact_ids = fields.get("artifact_ids", (0, [], ""))[1]
-    if "artifact_ids" in fields and (
-        not isinstance(artifact_ids, list)
-        or any(not isinstance(item, str) or not item.strip() for item in artifact_ids)
-        or len(set(artifact_ids)) != len(artifact_ids)
-    ):
-        raise LedgerParseError(f"{prefix} artifact_ids must be a list of unique strings")
+    if "artifact_ids" in fields:
+        if not isinstance(artifact_ids, list) or any(
+            not isinstance(item, str) or not item.strip() for item in artifact_ids
+        ):
+            raise LedgerParseError(f"{prefix} artifact_ids must be a list of unique strings")
+        artifact_ids = [item.strip() for item in artifact_ids]
+        if len(set(artifact_ids)) != len(artifact_ids):
+            raise LedgerParseError(f"{prefix} artifact_ids must be a list of unique strings")
     if status in _REQUIRED_WIRED_CHECK and not artifact_ids:
         raise LedgerParseError(f"{prefix} with status {status.value} requires non-empty artifact_ids")
     return LedgerEntry(cluster_id.strip(), status, wired_check, tuple(item.strip() for item in artifact_ids))

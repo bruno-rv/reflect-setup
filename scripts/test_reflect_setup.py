@@ -157,7 +157,7 @@ def test_reflection_continuation_validates_reports_and_writes_ranked_report():
 
 def test_codex_continuation_matches_canonical_session_scope_with_subagents():
     for include_subagents, expected_paths in (
-        (False, ("canonical.jsonl",)),
+        (False, ("canonical.jsonl", "subagent.jsonl")),
         (True, ("canonical.jsonl", "subagent.jsonl")),
     ):
         with TemporaryDirectory() as raw:

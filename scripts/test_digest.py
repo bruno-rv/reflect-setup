@@ -479,15 +479,45 @@ def test_codex_run_filters_subagent_threads_and_records_manifest_paths():
         spec = resolve_runtime("codex", home=root, env={}, source_root=source_root)
         scope = Scope(datetime(2026, 8, 23, tzinfo=timezone.utc), None, False)
         manifest = run_digest(spec, scope, root / "out")
-        assert manifest.sessions_scanned == 1
+        assert manifest.sessions_scanned == 2
         assert manifest.sessions_with_signals == 1
         assert manifest.signal_counts["user"] == 1
-        assert [source.source_path for source in manifest.source_files] == ["canonical.jsonl"]
+        assert [source.source_path for source in manifest.source_files] == [
+            "canonical.jsonl",
+            "subagent.jsonl",
+        ]
         assert manifest.source_files[0].digest_path is not None
+        assert manifest.source_files[1].digest_path is None
         assert manifest.source_files[0].project == "project__with__underscores"
         assert json.loads((root / "out" / "manifest.json").read_text())["source_files"][0]["project"] == "project__with__underscores"
         assert "# project: project__with__underscores" in next((root / "out").glob("*.md")).read_text()
         assert json.loads((root / "out" / "manifest.json").read_text())["runtime"] == "codex"
+
+
+def test_codex_missing_or_invalid_session_metadata_is_recorded_as_incomplete():
+    for filename, content in (
+        ("malformed.jsonl", "{not valid json\n"),
+        ("missing-meta.jsonl", '{"type":"event_msg","timestamp":"2026-08-23T10:00:00Z"}\n'),
+        ("invalid-meta.jsonl", '{"type":"session_meta","payload":{"thread_source":"user"}}\n'),
+    ):
+        with TemporaryDirectory() as raw:
+            root = Path(raw)
+            source_root = root / "sessions"
+            source_root.mkdir()
+            (source_root / filename).write_text(content)
+            spec = resolve_runtime("codex", home=root, env={}, source_root=source_root)
+            scope = Scope(datetime(2026, 8, 23, tzinfo=timezone.utc), None, False)
+            try:
+                run_digest(spec, scope, root / "out")
+            except IncompleteDigestError as exc:
+                assert exc.manifest.sessions_scanned == 1
+                assert exc.manifest.complete is False
+                source = exc.manifest.source_files[0]
+                assert source.source_path == filename
+                if filename == "malformed.jsonl":
+                    assert source.malformed_lines == 1
+            else:
+                raise AssertionError("invalid Codex metadata must fail closed")
 
 
 def test_end_to_end_writes_digest_and_skips_empty_and_memory():

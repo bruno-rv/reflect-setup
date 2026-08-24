@@ -42,7 +42,7 @@
     ]
   },
   "manifests_complete": {"claude": false, "codex": false},
-  "malformed_lines": {"claude": 1, "codex": 1},
+  "malformed_lines": {"claude": 2, "codex": 2},
   "batch_report_counts": {"claude": 2, "codex": 2},
   "report_validation_failures": 0,
   "batch_coverage_complete": true,

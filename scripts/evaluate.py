@@ -505,7 +505,12 @@ def evaluate_fixtures(fixtures: Path) -> EvaluationResult:
     )
     manifests_complete = all(value for unused_runtime, value in manifest_completeness)
     subagents_filtered = all(
-        all("subagents" not in Path(source.source_path).parts for source in manifest.source_files)
+        all(
+            source.digest_path is None
+            for source in manifest.source_files
+            if "subagents" in Path(source.source_path).parts
+            or source.thread_source not in (None, "user")
+        )
         for manifest in manifests.values()
     )
     malformed_cases_checked = _check_malformed_fixtures(fixtures, scope)

@@ -78,6 +78,20 @@ def test_parser_requires_stable_artifact_ids_for_operating_entries():
         raise AssertionError("operating entries require stable artifact ids")
 
 
+def test_parser_rejects_artifact_ids_that_only_differ_by_whitespace():
+    source = """- id: fixture
+  status: fix-applied
+  wired_check: "next run invokes the hook"
+  artifact_ids: [a, " a"]
+"""
+    try:
+        parse_ledger(source)
+    except LedgerParseError as exc:
+        assert "artifact_ids" in str(exc)
+    else:
+        raise AssertionError("artifact IDs must be normalized before uniqueness checks")
+
+
 def test_parser_rejects_duplicate_ids_and_missing_wired_check():
     duplicate = "- id: fixture\n  status: new\n- id: fixture\n  status: monitor\n"
     try:

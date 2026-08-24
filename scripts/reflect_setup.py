@@ -43,7 +43,7 @@ from miner_contract import (
     parse_report,
     merge_reports,
 )
-from runtime import RuntimeSpec, Scope, discover_sessions, resolve_runtime
+from runtime import Runtime, RuntimeSpec, Scope, discover_sessions, resolve_runtime
 from scoring import CandidateScore, compute_metrics, rank_candidates, score_candidate
 from verification import FixVerification, verify_fix
 
@@ -109,6 +109,26 @@ def _scope_hash(scope: Scope) -> str:
     ).hexdigest()
 
 
+def _manifest_session_paths(manifest: DigestManifest) -> frozenset[str]:
+    """Return raw manifest paths that were in the selected session scope."""
+    paths: set[str] = set()
+    for source in manifest.source_files:
+        if not source.scanned:
+            continue
+        relative = Path(source.source_path)
+        if manifest.runtime is Runtime.CLAUDE:
+            if not manifest.scope.include_subagents and "subagents" in relative.parts:
+                continue
+        elif not manifest.scope.include_subagents and source.thread_source != "user":
+            continue
+        if manifest.scope.project_filter and (
+            not source.project or manifest.scope.project_filter not in source.project
+        ):
+            continue
+        paths.add(source.source_path)
+    return frozenset(paths)
+
+
 def _continuation_path(raw_path: str, out_dir: Path) -> Path:
     path = Path(raw_path).expanduser()
     if path.is_absolute():
@@ -155,11 +175,7 @@ def _validate_continuation_manifest(
         raise ReportValidationError("continuation manifest lacks scope hash")
     if scope_hash != _scope_hash(manifest.scope):
         raise ReportValidationError("continuation manifest scope hash changed")
-    expected_sessions = {
-        source.source_path
-        for source in manifest.source_files
-        if source.scanned
-    }
+    expected_sessions = _manifest_session_paths(manifest)
     current_sessions = {
         session.relative_path
         for session in discover_sessions(spec, manifest.scope)
@@ -276,6 +292,7 @@ def _load_manifest(out_dir: Path) -> DigestManifest | None:
                 in_scope_events=int(item["in_scope_events"]),
                 project=item.get("project", ""),
                 digest_path=item.get("digest_path"),
+                thread_source=item.get("thread_source"),
             )
             for item in raw_source_files
         )

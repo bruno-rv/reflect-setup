@@ -21,7 +21,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Mapping
 
-from runtime import Runtime, RuntimeSpec, Scope, discover_sessions
+from runtime import Runtime, RuntimeSpec, Scope
 
 
 USER_TRUNCATE = 500
@@ -71,6 +71,7 @@ class SourceFile:
     in_scope_events: int
     project: str
     digest_path: str | None
+    thread_source: str | None = None
 
 
 @_frozen_dataclass
@@ -340,10 +341,21 @@ def signals_from_event(
 
 
 def _candidate_paths(spec: RuntimeSpec, scope: Scope):
-    return tuple(
-        (session.relative_path, session.source_path)
-        for session in discover_sessions(spec, scope)
-    )
+    if not spec.source_root.is_dir():
+        return ()
+    try:
+        paths = sorted(spec.source_root.rglob("*.jsonl"))
+    except OSError:
+        return ()
+    candidates = []
+    for path in paths:
+        if not path.is_file():
+            continue
+        relative = path.relative_to(spec.source_root).as_posix()
+        if "memory" in Path(relative).parts:
+            continue
+        candidates.append((relative, path))
+    return tuple(candidates)
 
 
 def _codex_metadata(entry):
@@ -450,6 +462,7 @@ def _manifest_json(manifest: DigestManifest):
                 "in_scope_events": source.in_scope_events,
                 "project": source.project,
                 "digest_path": source.digest_path,
+                "thread_source": source.thread_source,
             }
             for source in manifest.source_files
         ],
@@ -478,6 +491,7 @@ def _scan_typed_source(spec, scope, relative_path, path):
     metadata_session = None
     metadata_thread_source = None
     metadata_project = ""
+    metadata_invalid = False
     relative_parts = Path(relative_path).parts
     source_project = (
         relative_parts[0]
@@ -502,8 +516,11 @@ def _scan_typed_source(spec, scope, relative_path, path):
                     continue
 
                 metadata = _codex_metadata(entry) if spec.runtime is Runtime.CODEX else None
-                if metadata is not None and metadata_session is None:
-                    metadata_session, metadata_thread_source, metadata_project = metadata
+                if spec.runtime is Runtime.CODEX and isinstance(entry, dict) and entry.get("type") == "session_meta":
+                    if metadata is None or metadata[0] is None or metadata[1] is None:
+                        metadata_invalid = True
+                    elif metadata_session is None:
+                        metadata_session, metadata_thread_source, metadata_project = metadata
                 timestamp = _utc_timestamp(entry.get("timestamp")) if isinstance(entry, dict) else None
                 if timestamp is None:
                     untimestamped_lines += 1
@@ -531,11 +548,17 @@ def _scan_typed_source(spec, scope, relative_path, path):
             in_scope_events=in_scope_events,
             project=source_project,
             digest_path=None,
+            thread_source=None,
         )
         return source, (), False, (not scope.project_filter or spec.runtime is Runtime.CLAUDE)
 
     project_match = True
-    if spec.runtime is Runtime.CODEX:
+    if spec.runtime is Runtime.CLAUDE:
+        project_match = not scope.project_filter or scope.project_filter in source_project
+        canonical = scope.include_subagents or "subagents" not in relative_parts
+        if not project_match or not canonical:
+            signals = []
+    else:
         if metadata_session:
             session_id = metadata_session
         project_match = not scope.project_filter or (
@@ -565,8 +588,13 @@ def _scan_typed_source(spec, scope, relative_path, path):
         in_scope_events=in_scope_events,
         project=metadata_project if spec.runtime is Runtime.CODEX else source_project,
         digest_path=None,
+        thread_source=metadata_thread_source if spec.runtime is Runtime.CODEX else None,
     )
-    return source, typed_signals, malformed_lines == 0, project_match
+    metadata_complete = (
+        spec.runtime is not Runtime.CODEX
+        or (metadata_session is not None and not metadata_invalid)
+    )
+    return source, typed_signals, malformed_lines == 0 and metadata_complete, project_match
 
 
 def run_digest(spec: RuntimeSpec, scope: Scope, out_dir: Path) -> DigestManifest:
@@ -583,8 +611,6 @@ def run_digest(spec: RuntimeSpec, scope: Scope, out_dir: Path) -> DigestManifest
         source, signals, source_complete, in_project_scope = _scan_typed_source(
             spec, scope, relative_path, path
         )
-        if not in_project_scope:
-            continue
         source_records.append(source)
         pending.append((len(source_records) - 1, relative_path, signals))
         complete = complete and source_complete and source.readable
@@ -616,6 +642,7 @@ def run_digest(spec: RuntimeSpec, scope: Scope, out_dir: Path) -> DigestManifest
             in_scope_events=original.in_scope_events,
             project=original.project,
             digest_path=digest_path,
+            thread_source=original.thread_source,
         )
 
     manifest = DigestManifest(
