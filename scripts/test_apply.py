@@ -91,6 +91,71 @@ def test_proof_rejects_not_ok_even_when_generic_ok_is_present():
         raise AssertionError("explicit not ok status must fail closed")
 
 
+def test_proof_rejects_explicit_false_and_no_statuses():
+    preview = make_preview()
+    for status in ("status: false", "status: no", "result: false"):
+        proof = make_proof(
+            changed_paths=(Path("SKILL.md"),),
+            command_output=(status,),
+            verification_output=("true :: PASS",),
+            passed=True,
+        )
+        try:
+            validate_proof(preview, proof)
+        except ApplyProofError as exc:
+            assert "failure" in str(exc)
+        else:
+            raise AssertionError(f"explicit negative status must fail: {status}")
+
+
+def test_proof_rejects_traceback_header():
+    preview = make_preview()
+    proof = make_proof(
+        changed_paths=(Path("SKILL.md"),),
+        command_output=("Traceback (most recent call last):",),
+        verification_output=("true :: PASS",),
+        passed=True,
+    )
+    try:
+        validate_proof(preview, proof)
+    except ApplyProofError as exc:
+        assert "failure" in str(exc)
+    else:
+        raise AssertionError("traceback header must fail closed")
+
+
+def test_proof_rejects_failed_test_status():
+    preview = make_preview()
+    proof = make_proof(
+        changed_paths=(Path("SKILL.md"),),
+        command_output=("FAILED test_apply.py::test_status",),
+        verification_output=("true :: PASS",),
+        passed=True,
+    )
+    try:
+        validate_proof(preview, proof)
+    except ApplyProofError as exc:
+        assert "failure" in str(exc)
+    else:
+        raise AssertionError("failed test status must fail closed")
+
+
+def test_proof_rejects_nonzero_failed_test_count():
+    preview = make_preview()
+    proof = make_proof(
+        changed_paths=(Path("SKILL.md"),),
+        command_output=("tests failed: 1",),
+        verification_output=("true :: PASS",),
+        passed=True,
+    )
+    try:
+        validate_proof(preview, proof)
+    except ApplyProofError as exc:
+        assert "failure" in str(exc)
+    else:
+        raise AssertionError("nonzero failed test count must fail closed")
+
+
 def test_proof_rejects_explicit_failed_verification_status():
     preview = make_preview()
     proof = make_proof(
@@ -190,6 +255,37 @@ def test_verification_output_rejects_unknown_declared_command():
         assert "not declared" in str(exc)
     else:
         raise AssertionError("unknown command verification must fail")
+
+
+def test_verification_command_matching_preserves_byte_exact_whitespace():
+    declared = " python3 scripts/check_retry.py "
+    request = make_request(verification_commands=(declared,))
+    preview = build_preview(request, inventory=make_inventory(), workspace=make_workspace())
+    proof = make_proof(
+        changed_paths=(Path("SKILL.md"),),
+        command_output=("changed one file",),
+        verification_output=("python3 scripts/check_retry.py :: PASS",),
+        passed=True,
+    )
+    try:
+        validate_proof(preview, proof)
+    except ApplyProofError as exc:
+        assert "missing" in str(exc) or "declared" in str(exc)
+    else:
+        raise AssertionError("normalized command must not satisfy byte-exact match")
+
+
+def test_verification_command_matching_accepts_exact_whitespace():
+    declared = " python3 scripts/check_retry.py "
+    request = make_request(verification_commands=(declared,))
+    preview = build_preview(request, inventory=make_inventory(), workspace=make_workspace())
+    proof = make_proof(
+        changed_paths=(Path("SKILL.md"),),
+        command_output=("changed one file",),
+        verification_output=(" python3 scripts/check_retry.py  :: PASS",),
+        passed=True,
+    )
+    validate_proof(preview, proof)
 
 
 def test_two_approved_clusters_with_disjoint_paths_are_independent():

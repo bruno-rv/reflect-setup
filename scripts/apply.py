@@ -61,11 +61,14 @@ _NEGATIVE_STATUS = re.compile(
     r"(?:"
     r"\bnot\s+ok\b|"
     r"^\s*(?:fail(?:ed|ure)?|unsuccessful)\b(?=\s*(?:[:=-]|$))|"
+    r"^\s*failed\b|"
     r"^\s*error\b(?=\s*(?:[:=-]|$))|"
+    r"^\s*traceback\b(?=\s*(?:\(|:|$))|"
     r"\b(?:command|script|process)\s+(?:fail(?:ed|ure)?|error)\b|"
     r"\b(?:command|script|process)\s+exited\s+with\s+(?:code|status)\s+[1-9]\d*\b|"
-    r"\b(?:status|result|outcome)\s*[:=]\s*(?:not\s+ok|fail(?:ed|ure)?|error|unsuccessful)\b|"
+    r"\b(?:status|result|outcome)\s*[:=]\s*(?:not\s+ok|fail(?:ed|ure)?|error|unsuccessful|false|no|0)\b|"
     r"\b(?:exit|status|code)\s*[:=]?\s*[1-9]\d*\b|"
+    r"\b(?:tests?|checks?|commands?|scripts?)\s+failed\s*[:=]?\s*[1-9]\d*\b|"
     r"\b[1-9]\d*(?:\s+\w+){0,3}\s+(?:fail(?:ed|ure)?|errors?)\b|"
     r"\b(?:failures?|errors?)\s*[:=]\s*[1-9]\d*\b|"
     r"\b(?:non[- ]?zero)\s+exit\b|"
@@ -114,7 +117,7 @@ def _nonempty_strings(values: Iterable[str], *, label: str) -> tuple[str, ...]:
     result = tuple(values)
     if any(not isinstance(value, str) or not value.strip() for value in result):
         raise ValueError(f"{label} must contain non-empty strings")
-    return tuple(value.strip() for value in result)
+    return result
 
 
 def _validate_inventory(inventory: Inventory) -> None:
@@ -203,7 +206,7 @@ def _nonempty_output(values: Iterable[str], *, label: str) -> tuple[str, ...]:
 
 
 def _output_lines(output: tuple[str, ...]) -> tuple[str, ...]:
-    return tuple(line.strip() for item in output for line in item.splitlines() if line.strip())
+    return tuple(line for item in output for line in item.splitlines() if line.strip())
 
 
 def _reject_negative_statuses(output: tuple[str, ...]) -> tuple[str, ...]:
@@ -220,18 +223,18 @@ def _validate_verification_output(
     """Require exactly one ``<declared command> :: PASS`` line per command."""
     lines = _reject_negative_statuses(output)
     observed: set[str] = set()
+    pass_separator = " :: PASS"
     for line in lines:
-        if " :: " not in line:
+        if line.endswith(pass_separator):
+            command = line[: -len(pass_separator)]
+            if command not in commands:
+                raise ApplyProofError(f"verification command {command!r} was not declared")
+            if command in observed:
+                raise ApplyProofError(f"verification command {command!r} has duplicate output")
+            observed.add(command)
             continue
-        command, status = line.rsplit(" :: ", 1)
-        command = command.strip()
-        if status.strip().upper() != "PASS":
-            raise ApplyProofError(f"verification command {command!r} did not report PASS")
-        if command not in commands:
-            raise ApplyProofError(f"verification command {command!r} was not declared")
-        if command in observed:
-            raise ApplyProofError(f"verification command {command!r} has duplicate output")
-        observed.add(command)
+        if " :: " in line:
+            raise ApplyProofError("verification command did not report literal PASS")
     missing = tuple(command for command in commands if command not in observed)
     if missing:
         raise ApplyProofError(
