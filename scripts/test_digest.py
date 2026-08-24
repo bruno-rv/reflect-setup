@@ -494,6 +494,39 @@ def test_codex_run_filters_subagent_threads_and_records_manifest_paths():
         assert json.loads((root / "out" / "manifest.json").read_text())["runtime"] == "codex"
 
 
+def test_codex_user_without_project_or_cwd_keeps_signal_and_manifest_project():
+    with TemporaryDirectory() as raw:
+        root = Path(raw)
+        source_root = root / "sessions" / "2026" / "08" / "23"
+        source_root.mkdir(parents=True)
+        (source_root / "canonical.jsonl").write_text(
+            make_line(
+                {
+                    "type": "session_meta",
+                    "timestamp": "2026-08-23T09:00:00Z",
+                    "payload": {"id": "user-1", "thread_source": "user"},
+                }
+            )
+            + make_line(
+                {
+                    "type": "event_msg",
+                    "timestamp": "2026-08-23T10:00:00Z",
+                    "payload": {"type": "user_message", "message": "canonical user"},
+                }
+            )
+        )
+        spec = resolve_runtime("codex", home=root, env={}, source_root=root / "sessions")
+        scope = Scope(datetime(2026, 8, 23, tzinfo=timezone.utc), None, False)
+        manifest = run_digest(spec, scope, root / "out")
+        expected_project = "codex:2026/08/23/canonical.jsonl"
+        source = manifest.source_files[0]
+        assert manifest.sessions_with_signals == 1
+        assert manifest.signal_counts["user"] == 1
+        assert source.project == expected_project
+        persisted = json.loads((root / "out" / "manifest.json").read_text())
+        assert persisted["source_files"][0]["project"] == expected_project
+
+
 def test_codex_missing_or_invalid_session_metadata_is_recorded_as_incomplete():
     for filename, content in (
         ("malformed.jsonl", "{not valid json\n"),

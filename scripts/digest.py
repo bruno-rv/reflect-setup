@@ -21,7 +21,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Mapping
 
-from runtime import Runtime, RuntimeSpec, Scope, subagent_path_excluded
+from runtime import Runtime, RuntimeSpec, Scope, codex_project, subagent_path_excluded
 
 
 USER_TRUNCATE = 500
@@ -358,7 +358,7 @@ def _candidate_paths(spec: RuntimeSpec, scope: Scope):
     return tuple(candidates)
 
 
-def _codex_metadata(entry):
+def _codex_metadata(entry, source_context=""):
     if not isinstance(entry, dict) or entry.get("type") != "session_meta":
         return None
     payload = entry.get("payload")
@@ -366,16 +366,7 @@ def _codex_metadata(entry):
         return None
     session_id = payload.get("id")
     thread_source = payload.get("thread_source")
-    project = ""
-    for key in ("project", "project_name"):
-        value = payload.get(key)
-        if isinstance(value, str) and value:
-            project = value
-            break
-    if not project:
-        cwd = payload.get("cwd")
-        if isinstance(cwd, str) and cwd:
-            project = Path(cwd.rstrip("/\\")).name
+    project = codex_project(payload, source_context)
     return (
         session_id if isinstance(session_id, str) and session_id else None,
         thread_source if isinstance(thread_source, str) else None,
@@ -515,7 +506,11 @@ def _scan_typed_source(spec, scope, relative_path, path):
                     malformed_lines += 1
                     continue
 
-                metadata = _codex_metadata(entry) if spec.runtime is Runtime.CODEX else None
+                metadata = (
+                    _codex_metadata(entry, relative_path)
+                    if spec.runtime is Runtime.CODEX
+                    else None
+                )
                 if spec.runtime is Runtime.CODEX and isinstance(entry, dict) and entry.get("type") == "session_meta":
                     if metadata is None or metadata[0] is None or metadata[1] is None:
                         metadata_invalid = True

@@ -93,7 +93,16 @@ def test_proof_rejects_not_ok_even_when_generic_ok_is_present():
 
 def test_proof_rejects_explicit_false_and_no_statuses():
     preview = make_preview()
-    for status in ("status: false", "status: no", "result: false"):
+    for status in (
+        "status: false",
+        "status: no",
+        "result: false",
+        "outcome: no",
+        "ok: false",
+        "pass: no",
+        "success: 0",
+        "status: 1",
+    ):
         proof = make_proof(
             changed_paths=(Path("SKILL.md"),),
             command_output=(status,),
@@ -106,6 +115,18 @@ def test_proof_rejects_explicit_false_and_no_statuses():
             assert "failure" in str(exc)
         else:
             raise AssertionError(f"explicit negative status must fail: {status}")
+
+
+def test_proof_accepts_zero_status_result_and_outcome_with_exact_pass():
+    preview = make_preview()
+    for status in ("status: 0", "result: 0", "outcome: 0"):
+        proof = make_proof(
+            changed_paths=(Path("SKILL.md"),),
+            command_output=(status,),
+            verification_output=("true :: PASS",),
+            passed=True,
+        )
+        validate_proof(preview, proof)
 
 
 def test_proof_rejects_traceback_header():

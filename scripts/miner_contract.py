@@ -208,7 +208,11 @@ def _parse_evidence(
     index: int,
 ) -> EvidenceRef:
     value = _strict_object(raw, f"findings[].evidence[{index}]")
-    _exact_fields(value, _EVIDENCE_REQUIRED_FIELDS, f"findings[].evidence[{index}]")
+    missing = sorted(_EVIDENCE_REQUIRED_FIELDS - set(value))
+    if missing:
+        _fail(
+            f"findings[].evidence[{index}] missing fields: {', '.join(missing)}"
+        )
     extra = sorted(set(value) - _EVIDENCE_FIELDS)
     if extra:
         _fail(

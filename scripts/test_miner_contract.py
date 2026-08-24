@@ -65,6 +65,15 @@ def test_valid_report_preserves_typed_evidence():
     assert report.findings[0].confidence == 0.9
 
 
+def test_report_accepts_documented_evidence_occurrence_count():
+    manifest, batch = manifest_and_batch()
+    payload = valid_payload()
+    payload["findings"][0]["occurrence_count"] = 3
+    payload["findings"][0]["evidence"][0]["occurrence_count"] = 3
+    report = parse_report(json.dumps(payload), manifest, batch)
+    assert report.findings[0].evidence[0].occurrence_count == 3
+
+
 def test_report_accepts_strict_rfc3339_z_and_numeric_offset():
     manifest, batch = manifest_and_batch()
     for timestamp, expected in (

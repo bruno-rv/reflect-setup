@@ -196,6 +196,40 @@ def test_codex_continuation_matches_canonical_session_scope_with_subagents():
             ) == expected_paths
 
 
+def test_codex_continuation_preserves_missing_project_user_session():
+    with TemporaryDirectory() as raw:
+        root = Path(raw)
+        source_root = root / "sessions" / "2026" / "08" / "23"
+        source_root.mkdir(parents=True)
+        (source_root / "canonical.jsonl").write_text(
+            '{"type":"session_meta","timestamp":"2026-08-23T09:00:00Z",'
+            '"payload":{"id":"canonical-1","thread_source":"user"}}\n'
+            '{"type":"event_msg","timestamp":"2026-08-23T10:00:00Z",'
+            '"payload":{"type":"user_message","message":"canonical user"}}\n'
+        )
+        kwargs = dict(
+            runtime_name="codex",
+            home=root,
+            source_root=root / "sessions",
+            since=datetime(2026, 8, 23, tzinfo=timezone.utc),
+            project_filter=None,
+            include_subagents=False,
+            out_dir=root / "run",
+            apply=False,
+        )
+        for _ in range(2):
+            try:
+                run_reflection(miner_report_paths=(), **kwargs)
+            except ReportValidationError as exc:
+                assert "miner reports" in str(exc)
+            else:
+                raise AssertionError("signal-bearing continuation must require miner reports")
+            manifest = json.loads((root / "run" / "manifest.json").read_text())
+            assert manifest["source_files"][0]["project"] == (
+                "codex:2026/08/23/canonical.jsonl"
+            )
+
+
 def _prepare_ranked_continuation(root):
     source = root / "projects" / "project-a"
     source.mkdir(parents=True)

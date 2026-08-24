@@ -28,6 +28,13 @@ Only canonical user-originated records are signal candidates by default.
 Assistant prose, developer messages, successful tool output containing source
 code errors, and subagent/sidechain records are not user signals.
 
+Codex project identity uses `session_meta.payload.project` (or
+`project_name`), then the basename of `cwd`. When both are absent, the
+manifest and discovery layers use `codex:<relative source path>` as a stable
+fallback. This preserves canonical user signals without pretending an unknown
+session belongs to a named project; project filters still match only the
+resulting recorded identity.
+
 ## Inventory and coverage
 
 Inventory records `InventoryItem` declarations from runtime-specific roots.

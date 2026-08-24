@@ -143,6 +143,22 @@ def test_codex_discovery_keeps_canonical_user_threads_only():
         assert [item.session_id for item in sessions] == ["user-1"]
 
 
+def test_codex_discovery_uses_source_context_when_user_project_is_missing():
+    with TemporaryDirectory() as raw:
+        home = Path(raw)
+        root = home / ".codex" / "sessions" / "2026" / "08" / "23"
+        root.mkdir(parents=True)
+        (root / "user.jsonl").write_text(
+            '{"type":"session_meta","payload":{"id":"user-1",'
+            '"thread_source":"user"}}\n'
+        )
+        spec = resolve_runtime("codex", home=home, env={})
+        scope = Scope(datetime(2026, 8, 23, tzinfo=timezone.utc), None, False)
+        sessions = discover_sessions(spec, scope)
+        assert len(sessions) == 1
+        assert sessions[0].project == "codex:2026/08/23/user.jsonl"
+
+
 def test_codex_discovery_can_include_subagent_threads_and_uses_cwd_project():
     with TemporaryDirectory() as raw:
         home = Path(raw)

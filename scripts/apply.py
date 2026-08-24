@@ -66,7 +66,7 @@ _NEGATIVE_STATUS = re.compile(
     r"^\s*traceback\b(?=\s*(?:\(|:|$))|"
     r"\b(?:command|script|process)\s+(?:fail(?:ed|ure)?|error)\b|"
     r"\b(?:command|script|process)\s+exited\s+with\s+(?:code|status)\s+[1-9]\d*\b|"
-    r"\b(?:status|result|outcome)\s*[:=]\s*(?:not\s+ok|fail(?:ed|ure)?|error|unsuccessful|false|no|0)\b|"
+    r"\b(?:status|result|outcome)\s*[:=]\s*(?:not\s+ok|fail(?:ed|ure)?|error|unsuccessful|false|no)\b|"
     r"\b(?:exit|status|code)\s*[:=]?\s*[1-9]\d*\b|"
     r"\b(?:tests?|checks?|commands?|scripts?)\s+failed\s*[:=]?\s*[1-9]\d*\b|"
     r"\b[1-9]\d*(?:\s+\w+){0,3}\s+(?:fail(?:ed|ure)?|errors?)\b|"

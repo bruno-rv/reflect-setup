@@ -187,15 +187,21 @@ def _read_codex_metadata(path: Path) -> dict | None:
     return None
 
 
-def _codex_project(payload: Mapping[str, object]) -> str:
+def codex_project(payload: Mapping[str, object], source_context: str = "") -> str:
+    """Return Codex project metadata or a stable source-context identity."""
     for key in ("project", "project_name"):
         value = payload.get(key)
-        if isinstance(value, str) and value:
-            return value
+        if isinstance(value, str) and value.strip():
+            return value.strip()
     cwd = payload.get("cwd")
-    if isinstance(cwd, str) and cwd:
-        return Path(cwd.rstrip("/\\")).name
-    return ""
+    if isinstance(cwd, str) and cwd.strip():
+        project = Path(cwd.strip().rstrip("/\\")).name
+        if project:
+            return project
+    context = source_context.strip().replace("\\", "/")
+    if context:
+        return f"codex:{context}"
+    return "codex:unknown"
 
 
 def discover_sessions(spec: RuntimeSpec, scope: Scope) -> tuple[SessionRef, ...]:
@@ -232,7 +238,7 @@ def discover_sessions(spec: RuntimeSpec, scope: Scope) -> tuple[SessionRef, ...]
             session_id = payload.get("id")
             if not isinstance(session_id, str) or not session_id:
                 continue
-            project = _codex_project(payload)
+            project = codex_project(payload, relative_path)
 
         if _project_filter_matches(project, scope):
             sessions.append(SessionRef(spec.runtime, path, relative_path, session_id, project))
