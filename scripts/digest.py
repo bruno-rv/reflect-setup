@@ -70,6 +70,7 @@ class SourceFile:
     malformed_lines: int
     untimestamped_lines: int
     in_scope_events: int
+    project: str
     digest_path: str | None
 
 
@@ -426,12 +427,18 @@ def _signal_timestamp(timestamp: datetime):
     return timestamp.isoformat().replace("+00:00", "Z")
 
 
-def _write_typed_digest(out_dir: Path, relative_path: str, session_id: str, signals: tuple[Signal, ...]):
+def _write_typed_digest(
+    out_dir: Path,
+    relative_path: str,
+    session_id: str,
+    project: str,
+    signals: tuple[Signal, ...],
+):
     filename = _digest_filename(relative_path, session_id)
     path = out_dir / filename
     if path.exists():
         raise FileExistsError(f"digest output collision: {path}")
-    lines = [f"# {session_id}\n", "\n"]
+    lines = [f"# {session_id}\n", f"# project: {project}\n", "\n"]
     for signal in signals:
         lines.append(f"- {_signal_timestamp(signal.timestamp)} [{signal.kind.value}] {signal.text}\n")
     _atomic_write(path, "".join(lines))
@@ -458,6 +465,7 @@ def _manifest_json(manifest: DigestManifest):
                 "malformed_lines": source.malformed_lines,
                 "untimestamped_lines": source.untimestamped_lines,
                 "in_scope_events": source.in_scope_events,
+                "project": source.project,
                 "digest_path": source.digest_path,
             }
             for source in manifest.source_files
@@ -487,6 +495,12 @@ def _scan_typed_source(spec, scope, relative_path, path):
     metadata_session = None
     metadata_thread_source = None
     metadata_project = ""
+    relative_parts = Path(relative_path).parts
+    source_project = (
+        relative_parts[0]
+        if spec.runtime is Runtime.CLAUDE and len(relative_parts) > 1
+        else ""
+    )
     signals = []
     digest = hashlib.sha256()
     json_lines = malformed_lines = untimestamped_lines = in_scope_events = 0
@@ -532,6 +546,7 @@ def _scan_typed_source(spec, scope, relative_path, path):
             malformed_lines=malformed_lines,
             untimestamped_lines=untimestamped_lines,
             in_scope_events=in_scope_events,
+            project=source_project,
             digest_path=None,
         )
         return source, (), False, (not scope.project_filter or spec.runtime is Runtime.CLAUDE)
@@ -544,7 +559,8 @@ def _scan_typed_source(spec, scope, relative_path, path):
             metadata_project and scope.project_filter in metadata_project
         )
         canonical = metadata_session is not None and (
-            scope.include_subagents or metadata_thread_source == "user"
+            bool(metadata_project)
+            and (scope.include_subagents or metadata_thread_source == "user")
         )
         if not project_match or not canonical:
             signals = []
@@ -564,6 +580,7 @@ def _scan_typed_source(spec, scope, relative_path, path):
         malformed_lines=malformed_lines,
         untimestamped_lines=untimestamped_lines,
         in_scope_events=in_scope_events,
+        project=metadata_project if spec.runtime is Runtime.CODEX else source_project,
         digest_path=None,
     )
     return source, typed_signals, malformed_lines == 0, project_match
@@ -596,7 +613,14 @@ def run_digest(spec: RuntimeSpec, scope: Scope, out_dir: Path) -> DigestManifest
         sessions_with_signals += 1
         for signal in signals:
             signal_counts[signal.kind.value] += 1
-        digest_path = _write_typed_digest(out_dir, relative_path, signals[0].session_id, signals)
+        project = source_records[index].project
+        digest_path = _write_typed_digest(
+            out_dir,
+            relative_path,
+            signals[0].session_id,
+            project,
+            signals,
+        )
         original = source_records[index]
         source_records[index] = SourceFile(
             source_path=original.source_path,
@@ -607,6 +631,7 @@ def run_digest(spec: RuntimeSpec, scope: Scope, out_dir: Path) -> DigestManifest
             malformed_lines=original.malformed_lines,
             untimestamped_lines=original.untimestamped_lines,
             in_scope_events=original.in_scope_events,
+            project=original.project,
             digest_path=digest_path,
         )
 
@@ -682,7 +707,8 @@ def write_digest(out_dir, project, session_basename, signals):
     fname = f"{project}__{session_basename}.md"
     fpath = os.path.join(out_dir, fname)
     with open(fpath, "w", encoding="utf-8") as stream:
-        stream.write(f"# {session_basename} ({project})\n\n")
+        stream.write(f"# {session_basename} ({project})\n")
+        stream.write(f"# project: {project}\n\n")
         for kind, timestamp, text in signals:
             stream.write(f"- {timestamp} [{kind}] {text}\n")
     return fpath

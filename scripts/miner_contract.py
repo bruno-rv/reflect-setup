@@ -30,7 +30,7 @@ _FINDING_FIELDS = frozenset(
         "evidence",
     }
 )
-_EVIDENCE_FIELDS = frozenset({"digest_path", "source_line", "timestamp", "kind"})
+_EVIDENCE_FIELDS = frozenset({"digest_path", "source_line", "timestamp", "kind", "project"})
 _RFC3339_DATETIME = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
 )
@@ -56,6 +56,7 @@ class EvidenceRef:
     source_line: int
     timestamp: datetime
     kind: FindingType
+    project: str
 
 
 @_frozen_dataclass
@@ -160,6 +161,18 @@ def _manifest_paths(manifest: DigestManifest) -> frozenset[str]:
     return frozenset(paths)
 
 
+def _manifest_projects(manifest: DigestManifest) -> dict[str, str]:
+    projects = {}
+    for source in manifest.source_files:
+        if source.digest_path is None:
+            continue
+        project = _non_empty_string(source.project, f"manifest project for {source.digest_path}")
+        if source.digest_path in projects and projects[source.digest_path] != project:
+            _fail(f"manifest contains conflicting project metadata for {source.digest_path}")
+        projects[source.digest_path] = project
+    return projects
+
+
 def _evidence_key(ref: EvidenceRef) -> tuple[str, int]:
     return ref.digest_path, ref.source_line
 
@@ -186,6 +199,7 @@ def _parse_evidence(
     *,
     finding_type: FindingType,
     manifest_paths: frozenset[str],
+    manifest_projects: Mapping[str, str],
     batch_paths: frozenset[str],
     index: int,
 ) -> EvidenceRef:
@@ -196,6 +210,12 @@ def _parse_evidence(
         _fail(f"evidence digest path is missing from manifest: {digest_path}")
     if digest_path not in batch_paths:
         _fail(f"evidence digest path is outside assigned batch: {digest_path}")
+    project = _non_empty_string(value["project"], "evidence.project")
+    expected_project = manifest_projects.get(digest_path)
+    if expected_project is None:
+        _fail(f"evidence project metadata is missing from manifest: {digest_path}")
+    if project != expected_project:
+        _fail(f"evidence.project does not match manifest metadata for {digest_path}")
     source_line = value["source_line"]
     if isinstance(source_line, bool) or not isinstance(source_line, int) or source_line <= 0:
         _fail("evidence.source_line must be a positive integer")
@@ -213,10 +233,18 @@ def _parse_evidence(
         source_line=source_line,
         timestamp=_timestamp(value["timestamp"], "evidence.timestamp"),
         kind=kind,
+        project=project,
     )
 
 
-def _parse_finding(raw: Any, *, manifest_paths: frozenset[str], batch_paths: frozenset[str], index: int) -> Finding:
+def _parse_finding(
+    raw: Any,
+    *,
+    manifest_paths: frozenset[str],
+    manifest_projects: Mapping[str, str],
+    batch_paths: frozenset[str],
+    index: int,
+) -> Finding:
     value = _strict_object(raw, f"findings[{index}]")
     _exact_fields(value, _FINDING_FIELDS, f"findings[{index}]")
     cluster_key = _non_empty_string(value["cluster_key"], "finding.cluster_key")
@@ -250,6 +278,7 @@ def _parse_finding(raw: Any, *, manifest_paths: frozenset[str], batch_paths: fro
             raw_ref,
             finding_type=finding_type,
             manifest_paths=manifest_paths,
+            manifest_projects=manifest_projects,
             batch_paths=batch_paths,
             index=evidence_index,
         )
@@ -302,6 +331,7 @@ def parse_report(raw: str, manifest: DigestManifest, batch: BatchSpec) -> MinerR
     if len(set(assigned_paths)) != len(assigned_paths):
         _fail("assigned batch paths must not contain duplicates")
     manifest_paths = _manifest_paths(manifest)
+    manifest_projects = _manifest_projects(manifest)
     batch_path_set = frozenset(assigned_paths)
     if not batch_path_set.issubset(manifest_paths):
         missing = sorted(batch_path_set - manifest_paths)
@@ -313,6 +343,7 @@ def parse_report(raw: str, manifest: DigestManifest, batch: BatchSpec) -> MinerR
         _parse_finding(
             finding,
             manifest_paths=manifest_paths,
+            manifest_projects=manifest_projects,
             batch_paths=batch_path_set,
             index=index,
         )
@@ -327,6 +358,7 @@ def _validate_typed_finding(
     *,
     report_paths: tuple[str, ...],
     manifest_paths: frozenset[str],
+    manifest_projects: Mapping[str, str],
     label: str,
 ) -> None:
     if not isinstance(finding.finding_type, FindingType):
@@ -356,6 +388,10 @@ def _validate_typed_finding(
             _fail(f"{evidence_label}.digest_path is missing from manifest: {digest_path}")
         if digest_path not in report_paths:
             _fail(f"{evidence_label}.digest_path is outside assigned batch: {digest_path}")
+        project = _non_empty_string(ref.project, f"{evidence_label}.project")
+        expected_project = manifest_projects.get(digest_path)
+        if expected_project is None or project != expected_project:
+            _fail(f"{evidence_label}.project does not match manifest metadata")
         if isinstance(ref.source_line, bool) or not isinstance(ref.source_line, int) or ref.source_line <= 0:
             _fail(f"{evidence_label}.source_line must be a positive integer")
         if not isinstance(ref.timestamp, datetime) or ref.timestamp.tzinfo is None:
@@ -390,6 +426,7 @@ def _typed_report_paths(report: MinerReport, manifest: DigestManifest) -> tuple[
     if len(set(paths)) != len(paths):
         _fail(f"report {report.batch_id!r} has duplicate digest paths")
     manifest_paths = _manifest_paths(manifest)
+    manifest_projects = _manifest_projects(manifest)
     unknown = sorted(set(paths) - manifest_paths)
     if unknown:
         _fail(f"report digest path is missing from manifest: {', '.join(unknown)}")
@@ -402,6 +439,7 @@ def _typed_report_paths(report: MinerReport, manifest: DigestManifest) -> tuple[
             finding,
             report_paths=paths,
             manifest_paths=manifest_paths,
+            manifest_projects=manifest_projects,
             label=f"report finding {finding_index}",
         )
     return paths
@@ -429,46 +467,58 @@ def merge_reports(reports: tuple[MinerReport, ...] | list[MinerReport], manifest
     if uncovered:
         _fail(f"uncovered manifest digest paths: {', '.join(uncovered)}")
 
-    groups: dict[str, list[Finding]] = {}
+    groups: dict[tuple[str, FindingType, str], list[Finding]] = {}
     for report in report_values:
         for finding in report.findings:
-            groups.setdefault(_normalize_cluster_key(finding.cluster_key), []).append(finding)
+            key = (
+                _normalize_cluster_key(finding.cluster_key),
+                finding.finding_type,
+                finding.session_id,
+            )
+            groups.setdefault(key, []).append(finding)
 
     merged = []
-    for normalized_key, findings in groups.items():
-        all_evidence: dict[tuple[str, int], tuple[EvidenceRef, str]] = {}
+    for (normalized_key, finding_type, session_id), findings in groups.items():
+        all_evidence: dict[tuple[str, int], EvidenceRef] = {}
         merged_count = 0
-        seen_count_evidence = set()
+        seen_observation_evidence = set()
         ordered_findings = sorted(
             findings,
             key=lambda item: (
                 min((ref.timestamp, ref.digest_path, ref.source_line) for ref in item.evidence),
                 item.session_id,
+                item.finding_type.value,
                 _normalize_cluster_key(item.paraphrase),
                 item.occurrence_count,
+                tuple(sorted(_evidence_key(ref) for ref in item.evidence)),
             ),
         )
         for finding in ordered_findings:
             finding_keys = {_evidence_key(ref) for ref in finding.evidence}
-            if finding_keys - seen_count_evidence:
+            if finding_keys - seen_observation_evidence:
                 merged_count += finding.occurrence_count
-                seen_count_evidence.update(finding_keys)
+                seen_observation_evidence.update(finding_keys)
             for ref in finding.evidence:
                 key = _evidence_key(ref)
-                candidate = (ref, finding.session_id)
                 existing = all_evidence.get(key)
-                if existing is None or (ref.timestamp, ref.kind.value, finding.session_id) < (
-                    existing[0].timestamp,
-                    existing[0].kind.value,
-                    existing[1],
+                if existing is None or (
+                    ref.timestamp,
+                    ref.project,
+                    ref.digest_path,
+                    ref.source_line,
+                ) < (
+                    existing.timestamp,
+                    existing.project,
+                    existing.digest_path,
+                    existing.source_line,
                 ):
-                    all_evidence[key] = candidate
-        evidence_with_sessions = sorted(
-            all_evidence.values(), key=lambda item: (item[0].timestamp, item[1], item[0].digest_path, item[0].source_line)
+                    all_evidence[key] = ref
+        evidence_values = sorted(
+            all_evidence.values(),
+            key=lambda ref: (ref.timestamp, ref.project, ref.digest_path, ref.source_line),
         )
-        if not evidence_with_sessions:
+        if not evidence_values:
             _fail(f"finding cluster has no evidence: {normalized_key}")
-        first_ref, first_session = evidence_with_sessions[0]
         representative = min(
             findings,
             key=lambda item: (_normalize_cluster_key(item.paraphrase), len(item.paraphrase), item.paraphrase),
@@ -476,21 +526,22 @@ def merge_reports(reports: tuple[MinerReport, ...] | list[MinerReport], manifest
         merged.append(
             (
                 normalized_key,
-                first_ref.timestamp,
-                first_session,
+                session_id,
+                finding_type.value,
+                evidence_values[0].timestamp,
                 Finding(
                     cluster_key=normalized_key,
-                    finding_type=representative.finding_type,
-                    session_id=first_session,
+                    finding_type=finding_type,
+                    session_id=session_id,
                     paraphrase=representative.paraphrase,
                     occurrence_count=merged_count,
                     confidence=max(item.confidence for item in findings),
-                    evidence=tuple(item[0] for item in evidence_with_sessions),
+                    evidence=tuple(evidence_values),
                 ),
             )
         )
-    merged.sort(key=lambda item: (item[0], item[1], item[2]))
-    return tuple(item[3] for item in merged)
+    merged.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
+    return tuple(item[4] for item in merged)
 
 
 __all__ = [

@@ -442,7 +442,7 @@ def test_codex_run_filters_subagent_threads_and_records_manifest_paths():
                 {
                     "type": "session_meta",
                     "timestamp": "2026-08-23T09:00:00Z",
-                    "payload": {"id": "user-1", "thread_source": "user", "cwd": "/tmp/project-a"},
+                    "payload": {"id": "user-1", "thread_source": "user", "project": "project__with__underscores", "cwd": "/tmp/ignored"},
                 }
             )
             + make_line(
@@ -459,7 +459,7 @@ def test_codex_run_filters_subagent_threads_and_records_manifest_paths():
                 {
                     "type": "session_meta",
                     "timestamp": "2026-08-23T09:00:00Z",
-                    "payload": {"id": "agent-1", "thread_source": "subagent", "cwd": "/tmp/project-a"},
+                    "payload": {"id": "agent-1", "thread_source": "subagent", "project": "project__with__underscores", "cwd": "/tmp/ignored"},
                 }
             )
             + make_line(
@@ -482,6 +482,9 @@ def test_codex_run_filters_subagent_threads_and_records_manifest_paths():
         ]
         assert manifest.source_files[0].digest_path is not None
         assert manifest.source_files[1].digest_path is None
+        assert manifest.source_files[0].project == "project__with__underscores"
+        assert json.loads((root / "out" / "manifest.json").read_text())["source_files"][0]["project"] == "project__with__underscores"
+        assert "# project: project__with__underscores" in next((root / "out").glob("*.md")).read_text()
         assert json.loads((root / "out" / "manifest.json").read_text())["runtime"] == "codex"
 
 

@@ -1,4 +1,5 @@
 """Runnable checks for deterministic reflection candidate scoring."""
+from dataclasses import replace
 from datetime import datetime, timezone
 
 from scoring import compute_metrics, rank_candidates, score_candidate
@@ -71,7 +72,7 @@ def test_zero_analyzed_sessions_produce_zero_rate_without_division_error():
     assert metrics.occurrences_per_100_sessions == 0.0
 
 
-def test_confidence_is_clamped_at_input_boundary():
+def test_confidence_at_input_boundary_is_preserved():
     metrics = compute_metrics(
         findings=make_findings(
             occurrences=1,
@@ -81,11 +82,26 @@ def test_confidence_is_clamped_at_input_boundary():
         ),
         analyzed_sessions=1,
         regression_count=0,
-        confidence=1.5,
+        confidence=1.0,
         implementation_cost="S",
     )
     assert 0.0 <= metrics.confidence <= 1.0
     assert metrics.confidence == 1.0
+
+
+def test_invalid_confidence_is_rejected():
+    try:
+        compute_metrics(
+            findings=make_findings(1, ("s1",), ("p1",), ("2026-08-23",)),
+            analyzed_sessions=1,
+            regression_count=0,
+            confidence=1.1,
+            implementation_cost="S",
+        )
+    except ValueError as exc:
+        assert "confidence" in str(exc)
+    else:
+        raise AssertionError("confidence outside [0, 1] must be rejected")
 
 
 def test_impact_averages_mixed_finding_types():
@@ -105,6 +121,7 @@ def test_impact_averages_mixed_finding_types():
                     source_line=1,
                     timestamp=datetime(2026, 8, 23, tzinfo=timezone.utc),
                     kind=finding_type,
+                    project=f"project-{index}",
                 ),
             ),
         )
@@ -114,6 +131,99 @@ def test_impact_averages_mixed_finding_types():
     )
     metrics = compute_metrics(findings, 4, 0, 0.5, "L")
     assert metrics.impact == 0.85
+
+
+def test_explicit_project_identity_handles_double_underscore_names():
+    from miner_contract import EvidenceRef, Finding, FindingType
+
+    findings = (
+        Finding(
+            cluster_key="project-test",
+            finding_type=FindingType.FAILURE,
+            session_id="session-a",
+            paraphrase="fixture",
+            occurrence_count=1,
+            confidence=0.9,
+            evidence=(
+                EvidenceRef(
+                    digest_path="opaque-output-name--hash.md",
+                    source_line=1,
+                    timestamp=datetime(2026, 8, 23, tzinfo=timezone.utc),
+                    kind=FindingType.FAILURE,
+                    project="team__alpha",
+                ),
+            ),
+        ),
+        Finding(
+            cluster_key="project-test",
+            finding_type=FindingType.FAILURE,
+            session_id="session-b",
+            paraphrase="fixture",
+            occurrence_count=1,
+            confidence=0.9,
+            evidence=(
+                EvidenceRef(
+                    digest_path="another-opaque-name--hash.md",
+                    source_line=1,
+                    timestamp=datetime(2026, 8, 23, tzinfo=timezone.utc),
+                    kind=FindingType.FAILURE,
+                    project="team__alpha",
+                ),
+            ),
+        ),
+    )
+    metrics = compute_metrics(findings, 2, 0, 0.9, "S")
+    assert metrics.projects == 1
+
+
+def test_utc_boundary_normalizes_dates_before_counting():
+    from miner_contract import EvidenceRef, Finding, FindingType
+
+    findings = tuple(
+        Finding(
+            cluster_key="utc-boundary",
+            finding_type=FindingType.FAILURE,
+            session_id=f"session-{index}",
+            paraphrase="fixture",
+            occurrence_count=1,
+            confidence=0.5,
+            evidence=(
+                EvidenceRef(
+                    digest_path=f"project-{index}.md",
+                    source_line=1,
+                    timestamp=timestamp,
+                    kind=FindingType.FAILURE,
+                    project=f"project-{index}",
+                ),
+            ),
+        )
+        for index, timestamp in enumerate(
+            (
+                datetime.fromisoformat("2026-08-22T23:30:00-02:00"),
+                datetime.fromisoformat("2026-08-23T00:15:00+00:00"),
+            )
+        )
+    )
+    metrics = compute_metrics(findings, 2, 0, 0.5, "S")
+    assert metrics.distinct_days == 1
+    assert metrics.first_seen == datetime(2026, 8, 23, 0, 15, tzinfo=timezone.utc)
+
+
+def test_zero_occurrences_with_regression_do_not_divide_by_zero():
+    metrics = compute_metrics((), 0, 1, 0.5, "S")
+    candidate = score_candidate("zero-occurrence", metrics)
+    assert metrics.occurrences == 0
+    assert candidate.score == -0.05
+
+
+def test_implementation_cost_breaks_equal_score_ties_before_cluster_key():
+    metrics = compute_metrics(make_findings(1, ("s1",), ("p1",), ("2026-08-23",)), 1, 0, 0.5, "S")
+    from scoring import rank_candidates
+
+    cheaper = score_candidate("z-cluster", replace(metrics, implementation_cost="S"))
+    more_expensive = score_candidate("a-cluster", replace(metrics, implementation_cost="L"))
+    ranked = rank_candidates((more_expensive, cheaper))
+    assert [item.cluster_key for item in ranked] == ["z-cluster", "a-cluster"]
 
 
 def run_all():

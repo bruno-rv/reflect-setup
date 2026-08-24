@@ -3,6 +3,7 @@ import json
 from datetime import datetime, timezone
 
 from miner_contract import (
+    EvidenceRef,
     Finding,
     FindingType,
     MinerReport,
@@ -18,6 +19,7 @@ def manifest_and_batch():
         run_id="run-1",
         files=("project__session-a--abc.md",),
         lines=(("project__session-a--abc.md", 4, "2026-08-23T10:00:00Z", "user"),),
+        project="project-a",
     )
     batch = make_batch("batch-1", ("project__session-a--abc.md",))
     return manifest, batch
@@ -41,6 +43,7 @@ def valid_payload(**overrides):
                 "evidence": [
                     {
                         "digest_path": "project__session-a--abc.md",
+                        "project": "project-a",
                         "source_line": 4,
                         "timestamp": "2026-08-23T10:00:00Z",
                         "kind": "failure",
@@ -101,6 +104,18 @@ def test_report_rejects_evidence_from_another_batch():
         assert "batch" in str(exc)
     else:
         raise AssertionError("cross-batch evidence must be rejected")
+
+
+def test_report_rejects_evidence_with_wrong_project_identity():
+    manifest, batch = manifest_and_batch()
+    payload = valid_payload()
+    payload["findings"][0]["evidence"][0]["project"] = "another-project"
+    try:
+        parse_report(json.dumps(payload), manifest, batch)
+    except ReportValidationError as exc:
+        assert "project" in str(exc)
+    else:
+        raise AssertionError("evidence project must match manifest metadata")
 
 
 def test_report_rejects_prose_and_out_of_range_confidence():
@@ -220,6 +235,38 @@ def test_merge_sums_distinct_evidence_and_sorts_clusters():
     assert merged[0].confidence == 0.5
 
 
+def test_merge_preserves_distinct_sessions_and_finding_types():
+    manifest = make_manifest(
+        run_id="run-1",
+        files=("a.md", "b.md", "c.md"),
+        projects=(("a.md", "project-a"), ("b.md", "project-b"), ("c.md", "project-c")),
+    )
+    reports = []
+    for batch_id, path, session_id, finding_type, project in (
+        ("batch-1", "a.md", "session-a", FindingType.FAILURE, "project-a"),
+        ("batch-2", "b.md", "session-b", FindingType.FAILURE, "project-b"),
+        ("batch-3", "c.md", "session-c", FindingType.COMPLAINT, "project-c"),
+    ):
+        evidence = EvidenceRef(
+            path,
+            1,
+            datetime(2026, 8, 23, tzinfo=timezone.utc),
+            finding_type,
+            project,
+        )
+        finding = Finding("same-cluster", finding_type, session_id, "fixture", 1, 0.8, (evidence,))
+        reports.append(MinerReport(1, "claude", "run-1", batch_id, (path,), (finding,), ()))
+
+    merged = merge_reports(tuple(reports), manifest)
+    assert [(item.session_id, item.finding_type) for item in merged] == [
+        ("session-a", FindingType.FAILURE),
+        ("session-b", FindingType.FAILURE),
+        ("session-c", FindingType.COMPLAINT),
+    ]
+    assert sum(item.occurrence_count for item in merged) == 3
+    assert [len(item.evidence) for item in merged] == [1, 1, 1]
+
+
 def test_merge_accounts_for_manifest_files_without_digest_paths():
     manifest = make_manifest(run_id="run-1", files=("a.md", "empty.md"))
     manifest = manifest.__class__(
@@ -236,6 +283,7 @@ def test_merge_accounts_for_manifest_files_without_digest_paths():
             malformed_lines=0,
             untimestamped_lines=0,
             in_scope_events=0,
+            project="fixture-project",
             digest_path=None,
         )),
         sessions_scanned=manifest.sessions_scanned,

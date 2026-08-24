@@ -50,7 +50,8 @@ Return exactly one JSON object with exactly these top-level fields:
       "evidence": [
         {
           "digest_path": "<assigned path>",
-          "source_line": 3,
+          "project": "<manifest project>",
+          "source_line": 4,
           "timestamp": "2026-08-23T10:00:00Z",
           "kind": "failure"
         }
@@ -70,9 +71,10 @@ Rules for the fields:
   `failure`, or `complaint`; evidence `kind` must match its finding type.
 - Each finding has exactly `cluster_key`, `finding_type`, `session_id`,
   `paraphrase`, `occurrence_count`, `confidence`, and `evidence` fields. Each
-  evidence item has exactly `digest_path`, `source_line`, `timestamp`, and
-  `kind` fields. Repeated evidence references with the same path and line are
-  counted once.
+  evidence item has exactly `digest_path`, `project`, `source_line`,
+  `timestamp`, and `kind` fields. `project` must be copied from the digest
+  manifest metadata for that path; never infer it from a digest filename.
+  Repeated evidence references with the same path and line are counted once.
 - `paraphrase` is non-empty, one line, and paraphrases the signal without
   copying sensitive transcript text.
 - `occurrence_count` is a positive integer. `confidence` is a number from

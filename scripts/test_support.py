@@ -3,11 +3,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-def make_manifest(run_id="run-1", files=("a.md",), lines=()):
+def make_manifest(run_id="run-1", files=("a.md",), lines=(), project="fixture-project", projects=()):
     from digest import DigestManifest, SourceFile
     from runtime import Runtime, Scope
 
     line_map = {path: count for path, count, unused_timestamp, unused_kind in lines}
+    project_map = dict(projects)
     records = tuple(
         SourceFile(
             source_path=path,
@@ -19,6 +20,7 @@ def make_manifest(run_id="run-1", files=("a.md",), lines=()):
             untimestamped_lines=0,
             in_scope_events=line_map.get(path, 1),
             digest_path=path,
+            project=project_map.get(path, project),
         )
         for path in files
     )
@@ -41,7 +43,7 @@ def make_batch(batch_id, paths):
     return BatchSpec(batch_id=batch_id, digest_paths=tuple(paths))
 
 
-def make_report(batch_id, path, run_id="run-1"):
+def make_report(batch_id, path, run_id="run-1", project="fixture-project"):
     from miner_contract import EvidenceRef, Finding, FindingType, MinerReport
 
     finding = Finding(
@@ -51,12 +53,12 @@ def make_report(batch_id, path, run_id="run-1"):
         paraphrase="fixture failure",
         occurrence_count=1,
         confidence=0.5,
-        evidence=(EvidenceRef(path, 1, datetime(2026, 8, 23, tzinfo=timezone.utc), FindingType.FAILURE),),
+        evidence=(EvidenceRef(path, 1, datetime(2026, 8, 23, tzinfo=timezone.utc), FindingType.FAILURE, project),),
     )
     return MinerReport(1, "claude", run_id, batch_id, (path,), (finding,), ())
 
 
-def make_evidence(path="evidence.md", line=1, label="outcome-pass"):
+def make_evidence(path="evidence.md", line=1, label="outcome-pass", project="fixture-project"):
     from miner_contract import EvidenceRef, FindingType
 
     return EvidenceRef(
@@ -64,6 +66,7 @@ def make_evidence(path="evidence.md", line=1, label="outcome-pass"):
         source_line=line,
         timestamp=datetime(2026, 8, 23, tzinfo=timezone.utc),
         kind=FindingType.FAILURE,
+        project=project,
     )
 
 
@@ -112,7 +115,7 @@ def make_findings(occurrences, sessions, projects, dates, cluster_key="fixture")
                 paraphrase="fixture failure in " + project,
                 occurrence_count=1,
                 confidence=0.8,
-                evidence=(EvidenceRef(project + ".md", index + 1, datetime.fromisoformat(day).replace(tzinfo=timezone.utc), FindingType.FAILURE),),
+                evidence=(EvidenceRef(project + ".md", index + 1, datetime.fromisoformat(day).replace(tzinfo=timezone.utc), FindingType.FAILURE, project),),
             )
         )
     return tuple(finding_values)

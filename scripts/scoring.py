@@ -5,7 +5,6 @@ import math
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Iterable, Literal
 
 from miner_contract import EvidenceRef, Finding, FindingType
@@ -14,6 +13,7 @@ from miner_contract import EvidenceRef, Finding, FindingType
 UTC = timezone.utc
 ImplementationCost = Literal["S", "M", "L"]
 _IMPLEMENTATION_COSTS = frozenset(("S", "M", "L"))
+_IMPLEMENTATION_COST_ORDER = {"S": 0, "M": 1, "L": 2}
 _IMPACT_WEIGHTS: dict[FindingType, float] = {
     FindingType.FAILURE: 1.0,
     FindingType.COMPLAINT: 0.9,
@@ -66,7 +66,9 @@ def _confidence(value: object) -> float:
     value = float(value)
     if not math.isfinite(value):
         raise ValueError("confidence must be a finite number")
-    return max(0.0, min(value, 1.0))
+    if not 0.0 <= value <= 1.0:
+        raise ValueError("confidence must be a number between 0 and 1")
+    return value
 
 
 def _implementation_cost(value: object) -> ImplementationCost:
@@ -83,19 +85,6 @@ def _utc_timestamp(value: datetime) -> datetime:
     return value.astimezone(UTC)
 
 
-def _project_key(digest_path: str) -> str:
-    """Derive a stable project key from a collision-safe digest filename.
-
-    The digest writer encodes the source path as ``project__session--hash``.
-    Simple fixture paths such as ``project.md`` naturally use their stem.
-    """
-    if not isinstance(digest_path, str) or not digest_path:
-        raise ValueError("evidence digest_path must be a non-empty string")
-    stem = Path(digest_path).name.rsplit(".", 1)[0]
-    readable = stem.split("--", 1)[0]
-    return readable.split("__", 1)[0] or readable
-
-
 def _finding_values(findings: Iterable[Finding]) -> tuple[Finding, ...]:
     values = tuple(findings)
     for finding in values:
@@ -110,6 +99,8 @@ def _finding_values(findings: Iterable[Finding]) -> tuple[Finding, ...]:
         for evidence in finding.evidence:
             if not isinstance(evidence, EvidenceRef):
                 raise TypeError("finding evidence must contain EvidenceRef values")
+            if not isinstance(evidence.project, str) or not evidence.project.strip():
+                raise ValueError("finding evidence must contain explicit project identity")
     return values
 
 
@@ -138,7 +129,7 @@ def compute_metrics(
         finding_types.append(finding.finding_type)
         for evidence in finding.evidence:
             timestamps.append(_utc_timestamp(evidence.timestamp))
-            projects.add(_project_key(evidence.digest_path))
+            projects.add(evidence.project)
 
     first_seen = min(timestamps) if timestamps else _EMPTY_TIMESTAMP
     last_seen = max(timestamps) if timestamps else _EMPTY_TIMESTAMP
@@ -242,6 +233,7 @@ def rank_candidates(candidates: Iterable[CandidateScore]) -> tuple[CandidateScor
                 -candidate.score,
                 candidate.metrics.regression_count,
                 candidate.metrics.first_seen,
+                _IMPLEMENTATION_COST_ORDER[candidate.metrics.implementation_cost],
                 candidate.cluster_key,
             ),
         )
