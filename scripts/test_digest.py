@@ -313,6 +313,52 @@ def test_codex_successful_tool_output_with_error_looking_detail_is_ignored():
     ) == ()
 
 
+def test_codex_error_looking_first_status_line_is_not_failure_metadata():
+    scope = Scope(datetime(2026, 8, 23, tzinfo=timezone.utc), None, False)
+    line = make_line(
+        {
+            "type": "response_item",
+            "timestamp": "2026-08-23T10:01:00Z",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "output": [
+                    {"type": "input_text", "text": "Error: source text only"},
+                    {"type": "input_text", "text": "successful tool details"},
+                ],
+            },
+        }
+    )
+    assert signals_from_event(
+        line,
+        runtime="codex",
+        session_id="session-1",
+        source_line=1,
+        scope=scope,
+    ) == ()
+
+
+def test_codex_successful_output_takes_precedence_over_error_looking_content():
+    scope = Scope(datetime(2026, 8, 23, tzinfo=timezone.utc), None, False)
+    line = make_line(
+        {
+            "type": "response_item",
+            "timestamp": "2026-08-23T10:01:00Z",
+            "payload": {
+                "type": "function_call_output",
+                "output": "Script completed",
+                "content": "Error: source text only",
+            },
+        }
+    )
+    assert signals_from_event(
+        line,
+        runtime="codex",
+        session_id="session-1",
+        source_line=1,
+        scope=scope,
+    ) == ()
+
+
 def test_numeric_timestamp_is_parsed_as_utc_and_old_events_are_excluded():
     scope = Scope(datetime(2026, 8, 23, tzinfo=timezone.utc), None, False)
     recent = make_line(

@@ -32,9 +32,8 @@ UTC = timezone.utc
 FAILURE_STATUS = re.compile(
     r"^(?:(?:script|command|process)\s+(?:failed|error)\b|"
     r"(?:script|command|process)\s+exited\s+with\s+(?:code|status)\s+[1-9]\d*\b|"
-    r"(?:exit\s+code|status)\s*[:=]\s*(?:[1-9]\d*|error|failed|failure)\b|"
-    r"(?:non[- ]?zero)\s+exit\b|"
-    r"(?:error|failure)\s*[:!-])",
+    r"(?:exit\s+code|status)\s*[:=]\s*[1-9]\d*\b|"
+    r"(?:non[- ]?zero)\s+exit\b)",
     re.IGNORECASE,
 )
 
@@ -242,10 +241,10 @@ def _codex_failure_text(payload):
     """Return output only when its first status line explicitly signals failure."""
     if not isinstance(payload, dict):
         return ""
-    for key in ("output", "content"):
-        text = _text_value(payload.get(key)).strip()
-        if text and FAILURE_STATUS.search(text.splitlines()[0].strip()):
-            return text
+    key = "output" if "output" in payload else "content"
+    text = _text_value(payload.get(key)).strip()
+    if text and FAILURE_STATUS.match(text.splitlines()[0].strip()):
+        return text
     return ""
 
 
