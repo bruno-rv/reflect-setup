@@ -1,0 +1,7 @@
+{"type":"session_meta","timestamp":"2026-08-01T09:59:00Z","payload":{"id":"codex-canonical","thread_source":"user","project":"synthetic-project"}}
+{"type":"response_item","timestamp":"2026-08-23T11:00:00Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Correction: use the fixture parser."}]}}
+{"type":"response_item","timestamp":"2026-08-23T11:01:00Z","payload":{"type":"function_call_output","is_error":true,"output":"Synthetic command failed."}}
+{"type":"event_msg","timestamp":"2026-08-23T11:02:00Z","payload":{"type":"interrupt","text":"[Request interrupted by synthetic fixture]"}}
+{"type":"response_item","timestamp":"2026-08-23T11:03:00Z","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Error: this assistant example is not a result."}]}}
+{"type":"response_item","timestamp":"2026-08-23T11:04:00Z","payload":{"type":"function_call_output","is_error":false,"output":"source_code = \"Error: example text only\""}}
+{"type":"response_item","timestamp":"2026-08-01T11:05:00Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Old synthetic event excluded by the window."}]}}

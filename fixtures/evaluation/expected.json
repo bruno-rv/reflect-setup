@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "window_since": "2026-08-23T00:00:00Z",
+  "retained_signals": {
+    "claude": [
+      {"session_id": "canonical", "source_line": 1, "kind": "user"},
+      {"session_id": "canonical", "source_line": 2, "kind": "error"},
+      {"session_id": "canonical", "source_line": 3, "kind": "interrupt"}
+    ],
+    "codex": [
+      {"session_id": "codex-canonical", "source_line": 2, "kind": "user"},
+      {"session_id": "codex-canonical", "source_line": 3, "kind": "error"},
+      {"session_id": "codex-canonical", "source_line": 4, "kind": "interrupt"}
+    ]
+  },
+  "excluded_records": {
+    "claude": [
+      {"session_id": "canonical", "source_line": 4, "reason": "assistant text"},
+      {"session_id": "canonical", "source_line": 5, "reason": "successful tool output"},
+      {"session_id": "canonical", "source_line": 6, "reason": "old event"}
+    ],
+    "codex": [
+      {"session_id": "codex-canonical", "source_line": 5, "reason": "assistant text"},
+      {"session_id": "codex-canonical", "source_line": 6, "reason": "successful tool output"},
+      {"session_id": "codex-canonical", "source_line": 7, "reason": "old event"}
+    ]
+  },
+  "manifests_complete": {"claude": true, "codex": true},
+  "batch_coverage_complete": true,
+  "score_is_deterministic": true
+}
