@@ -107,7 +107,12 @@ def _check_evidence(
     )
 
 
-def _symptom_status(evidence: tuple[VerificationEvidence, ...]) -> tuple[CheckStatus, str]:
+def _symptom_status(
+    evidence: tuple[VerificationEvidence, ...],
+    coverage_recurred: bool = False,
+) -> tuple[CheckStatus, str]:
+    if coverage_recurred:
+        return CheckStatus.FAIL, "target coverage record reports current symptom recurrence"
     if not evidence:
         return CheckStatus.INSUFFICIENT, "no explicit non-recurrence evidence"
     labels = {_label_value(item.label, "symptom_evidence") for item in evidence}
@@ -171,7 +176,7 @@ def _coverage_contribution(
     targets: frozenset[str],
     invocation_evidence: tuple[VerificationEvidence, ...],
     outcome_evidence: tuple[VerificationEvidence, ...],
-) -> tuple[tuple[VerificationEvidence, ...], tuple[VerificationEvidence, ...]]:
+) -> tuple[tuple[VerificationEvidence, ...], tuple[VerificationEvidence, ...], bool]:
     """Use each aggregate coverage record on one side of the evidence split.
 
     ``CoverageRecord.evidence`` is a combined sequence in the preceding
@@ -183,12 +188,15 @@ def _coverage_contribution(
     outcome_keys = {_evidence_key(item.ref) for item in outcome_evidence}
     invocation: list[VerificationEvidence] = []
     outcome: list[VerificationEvidence] = []
+    symptom_recurred = False
     for record in records:
         if record.artifact_id not in targets or not record.declared or not record.eligible:
             continue
         refs = tuple(record.evidence)
         if any(not isinstance(ref, EvidenceRef) for ref in refs):
             raise TypeError("coverage record evidence must contain EvidenceRef instances")
+        if record.prevented is False:
+            symptom_recurred = True
         if record.triggered and not invocation_evidence:
             invocation.extend(VerificationEvidence(ref, VerificationLabel.INVOKED) for ref in refs)
             invocation_keys.update(_evidence_key(ref) for ref in refs)
@@ -202,7 +210,7 @@ def _coverage_contribution(
                 key = _evidence_key(ref)
                 if key not in invocation_keys and key not in outcome_keys:
                     outcome.append(VerificationEvidence(ref, VerificationLabel.OUTCOME_FAIL))
-    return tuple(invocation), tuple(outcome)
+    return tuple(invocation), tuple(outcome), symptom_recurred
 
 
 def verify_fix(
@@ -244,7 +252,7 @@ def verify_fix(
     for record in records:
         if not isinstance(record, CoverageRecord):
             raise TypeError("coverage_records must contain CoverageRecord instances")
-    coverage_invocation, coverage_outcome = _coverage_contribution(
+    coverage_invocation, coverage_outcome, coverage_recurred = _coverage_contribution(
         records, targets, tuple(invocation), tuple(outcome)
     )
     if not invocation:
@@ -255,7 +263,7 @@ def verify_fix(
     symptom_values = tuple(symptom)
     invocation_values = tuple(invocation)
     outcome_values = tuple(outcome)
-    symptom_status, symptom_detail = _symptom_status(symptom_values)
+    symptom_status, symptom_detail = _symptom_status(symptom_values, coverage_recurred)
     invocation_status, invocation_detail = _invocation_status(invocation_values)
     outcome_status, outcome_detail = _outcome_status(outcome_values, invocation_values)
     symptom_check = _check_evidence(

@@ -218,6 +218,31 @@ def test_unrelated_coverage_cannot_contribute_to_a_fix():
     assert result.overall is CheckStatus.INSUFFICIENT
 
 
+def test_target_coverage_recurrence_overrides_explicit_symptom_absence():
+    from coverage_model import assess_coverage
+    from test_support import make_evidence
+
+    record = assess_coverage(
+        artifact_id="skill:fixture",
+        artifact_kind="skill",
+        exists=True,
+        eligible=True,
+        trigger_evidence=(make_evidence("trigger.md", 3, "trigger"),),
+        prevention_evidence=(make_evidence("outcome.md", 8, "outcome"),),
+        symptom_recurred=True,
+    )
+    result = verify_fix(
+        make_entry("fixture", wired_check="skill:fixture"),
+        symptom_evidence=make_evidence_set("symptom-absent"),
+        invocation_evidence=make_evidence_set("invoked"),
+        outcome_evidence=make_evidence_set("outcome-pass"),
+        coverage_records=(record,),
+    )
+    assert result.symptom.status is CheckStatus.FAIL
+    assert result.overall is CheckStatus.FAIL
+    assert result.recommended_status == "built-not-operating"
+
+
 def test_verify_fix_evidence_arguments_are_keyword_only():
     try:
         verify_fix(make_entry("fixture"), (), (), ())
