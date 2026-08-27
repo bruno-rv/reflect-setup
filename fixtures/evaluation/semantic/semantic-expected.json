@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "window_since": "2026-08-23T00:00:00Z",
+  "expected_clusters": [
+    {
+      "cluster_key": "patch-context-drift",
+      "summary": "Patch context drifted and failed to apply.",
+      "sessions": ["semantic-a", "semantic-b"],
+      "projects": ["semantic-project-a", "semantic-project-b"],
+      "finding_types": ["failure"],
+      "evidence_count": 2
+    },
+    {
+      "cluster_key": "missing-dependency",
+      "summary": "Build failed because a dependency is missing.",
+      "sessions": ["semantic-c"],
+      "projects": ["semantic-project-c"],
+      "finding_types": ["failure"],
+      "evidence_count": 1
+    },
+    {
+      "cluster_key": "stale-build-cache",
+      "summary": "Build failed because the cache is stale.",
+      "sessions": ["semantic-d"],
+      "projects": ["semantic-project-d"],
+      "finding_types": ["failure"],
+      "evidence_count": 1
+    },
+    {
+      "cluster_key": "retry-hook-failure",
+      "summary": "The retry hook keeps failing.",
+      "sessions": ["tampered"],
+      "projects": ["semantic-project-g"],
+      "finding_types": ["failure"],
+      "evidence_count": 1
+    }
+  ],
+  "expected_ordering": [
+    "patch-context-drift",
+    "missing-dependency",
+    "stale-build-cache",
+    "retry-hook-failure"
+  ],
+  "excluded_sessions": ["continuation", "zero-signal"],
+  "tampered_session": "tampered",
+  "unreadable_session": "unreadable",
+  "subagent_session": "subagent-include",
+  "include_subagents": true
+}

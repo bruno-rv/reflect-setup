@@ -172,7 +172,9 @@ def make_tied_candidates(keys):
     return tuple(
         score_candidate(
             key,
-            compute_metrics(make_findings(1, ("s1",), ("p1",), ("2026-08-23",), key), 1, 0, 0.5, "S"),
+            "fixture failure",
+            make_findings(1, ("s1",), ("p1",), ("2026-08-23",), key),
+            compute_metrics(make_findings(1, ("s1",), ("p1",), ("2026-08-23",), key), 1, 0),
         )
         for key in keys
     )

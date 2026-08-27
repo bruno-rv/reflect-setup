@@ -1,0 +1,2 @@
+{"type":"user","timestamp":"2026-08-23T11:00:00Z","message":{"role":"user","content":"Patch context error again in this project."}}
+{"type":"user","timestamp":"2026-08-23T11:01:00Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"patch-tool-b","is_error":true,"content":"error: patch does not apply cleanly"}]}}

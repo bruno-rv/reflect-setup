@@ -1,0 +1,4 @@
+{"type":"session_meta","timestamp":"2026-08-23T09:00:00Z","payload":{"id":"semantic-a","thread_source":"user","project":"semantic-project-a"}}
+{"type":"response_item","timestamp":"2026-08-23T10:00:00Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"The patch failed to apply again: context mismatch on the retry hook."}]}}
+{"type":"response_item","timestamp":"2026-08-23T10:01:00Z","payload":{"type":"function_call_output","is_error":true,"output":"patch command failed: context does not match"}}
+{"type":"response_item","timestamp":"2026-08-23T10:02:00Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"This is the third time the patch context drifted."}]}}

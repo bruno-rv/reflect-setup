@@ -1,0 +1,2 @@
+{"type":"user","timestamp":"2026-08-23T16:00:00Z","message":{"role":"user","content":"The retry hook keeps failing."}}
+{"type":"user","timestamp":"2026-08-23T16:01:00Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"retry-tool","is_error":true,"content":"retry hook failed"}]}}

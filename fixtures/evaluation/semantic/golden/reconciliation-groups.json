@@ -1,0 +1,28 @@
+{
+  "groups": [
+    {
+      "cluster_key": "patch-context-drift",
+      "summary": "Patch context drifted and failed to apply.",
+      "rationale": "Both sessions describe the same patch-context failure.",
+      "sessions": ["semantic-a", "semantic-b"]
+    },
+    {
+      "cluster_key": "missing-dependency",
+      "summary": "Build failed because a dependency is missing.",
+      "rationale": "The dependency is missing from the environment.",
+      "sessions": ["semantic-c"]
+    },
+    {
+      "cluster_key": "stale-build-cache",
+      "summary": "Build failed because the cache is stale.",
+      "rationale": "The build cache is stale.",
+      "sessions": ["semantic-d"]
+    },
+    {
+      "cluster_key": "retry-hook-failure",
+      "summary": "The retry hook keeps failing.",
+      "rationale": "The retry hook failed in the tampered session.",
+      "sessions": ["tampered"]
+    }
+  ]
+}

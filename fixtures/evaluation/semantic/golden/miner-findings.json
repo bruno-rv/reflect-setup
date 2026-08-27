@@ -1,0 +1,78 @@
+{
+  "claude": {
+    "semantic-project-a/semantic-a.jsonl": {
+      "cluster_key": "patch context drift",
+      "finding_type": "failure",
+      "paraphrase": "Patch context drifted and failed to apply.",
+      "evidence_lines": [2]
+    },
+    "semantic-project-b/semantic-b.jsonl": {
+      "cluster_key": "patch apply failure",
+      "finding_type": "failure",
+      "paraphrase": "Patch does not apply cleanly.",
+      "evidence_lines": [2]
+    },
+    "semantic-project-c/semantic-c.jsonl": {
+      "cluster_key": "missing dependency",
+      "finding_type": "failure",
+      "paraphrase": "Build failed because a dependency is missing.",
+      "evidence_lines": [2]
+    },
+    "semantic-project-d/semantic-d.jsonl": {
+      "cluster_key": "stale build cache",
+      "finding_type": "failure",
+      "paraphrase": "Build failed because the cache is stale.",
+      "evidence_lines": [2]
+    },
+    "semantic-project-g/tampered.jsonl": {
+      "cluster_key": "retry hook failure",
+      "finding_type": "failure",
+      "paraphrase": "The retry hook keeps failing.",
+      "evidence_lines": [2]
+    },
+    "semantic-project-e/continuation.jsonl": {
+      "findings": []
+    },
+    "semantic-project-f/zero-signal.jsonl": {
+      "findings": []
+    }
+  },
+  "codex": {
+    "semantic-a.jsonl": {
+      "cluster_key": "patch context drift",
+      "finding_type": "failure",
+      "paraphrase": "Patch context drifted and failed to apply.",
+      "evidence_lines": [3]
+    },
+    "semantic-b.jsonl": {
+      "cluster_key": "patch apply failure",
+      "finding_type": "failure",
+      "paraphrase": "Patch does not apply cleanly.",
+      "evidence_lines": [3]
+    },
+    "semantic-c.jsonl": {
+      "cluster_key": "missing dependency",
+      "finding_type": "failure",
+      "paraphrase": "Build failed because a dependency is missing.",
+      "evidence_lines": [3]
+    },
+    "semantic-d.jsonl": {
+      "cluster_key": "stale build cache",
+      "finding_type": "failure",
+      "paraphrase": "Build failed because the cache is stale.",
+      "evidence_lines": [3]
+    },
+    "tampered.jsonl": {
+      "cluster_key": "retry hook failure",
+      "finding_type": "failure",
+      "paraphrase": "The retry hook keeps failing.",
+      "evidence_lines": [3]
+    },
+    "continuation.jsonl": {
+      "findings": []
+    },
+    "zero-signal.jsonl": {
+      "findings": []
+    }
+  }
+}

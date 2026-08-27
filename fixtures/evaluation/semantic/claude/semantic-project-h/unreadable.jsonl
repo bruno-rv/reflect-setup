@@ -1,0 +1,2 @@
+{"type":"user","timestamp":"2026-08-23T18:00:00Z","message":{"role":"user","content":"A session that becomes unreadable during the scan."}}
+{"type":"user","timestamp":"2026-08-23T18:01:00Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"unreadable-tool","is_error":true,"content":"unreadable tool failed"}]}}

@@ -2,7 +2,8 @@
 """Evaluate the synthetic Claude/Codex reflection corpus.
 
 The harness stages committed fixtures in a temporary runtime-shaped source
-tree, runs the public digest and miner-batch interfaces, and emits a stable
+tree, drives the complete staged workflow (digest -> persisted dispatch plan
+-> golden miner reports -> reconciliation -> ranking), and emits a stable
 JSON summary.  It deliberately never reads a user's live session directory.
 """
 from __future__ import annotations
@@ -17,12 +18,28 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Mapping
+from typing import Any, Iterable, Mapping
 
 from digest import IncompleteDigestError, Signal, signals_from_event, run_digest
-from miner_contract import EvidenceRef, Finding, FindingType, MinerReport, merge_reports
+from miner_contract import (
+    EvidenceRef,
+    Finding,
+    FindingType,
+    MinerReport,
+    ReportValidationError,
+    merge_reports,
+)
+from reconciliation import (
+    ReconciliationGroup,
+    ReconciliationReport,
+    build_request,
+    finding_id,
+    parse_report as parse_reconciliation_report,
+    validate_groups,
+)
 from runtime import Runtime, Scope, discover_sessions, resolve_runtime
-from scoring import rank_candidates, score_candidate, compute_metrics
+from scoring import CandidateScore, rank_candidates
+from workflow_contract import DispatchPlan, RunStage
 
 
 UTC = timezone.utc
@@ -63,6 +80,14 @@ class EvaluationResult:
     malformed_lines: tuple[tuple[str, int], ...]
     batch_report_counts: tuple[tuple[str, int], ...]
     ranking: tuple[str, ...]
+    cluster_precision: float
+    cluster_recall: float
+    cluster_false_positives: int
+    evidence_violations: int
+    reason_violations: int
+    reconciliation_complete: bool
+    stage_sequence: tuple[str, ...]
+    expected_ordering: tuple[str, ...]
 
     @property
     def batch_coverage(self) -> bool:
@@ -87,6 +112,14 @@ class EvaluationResult:
             "malformed_lines": dict(self.malformed_lines),
             "batch_report_counts": dict(self.batch_report_counts),
             "ranking": list(self.ranking),
+            "cluster_precision": self.cluster_precision,
+            "cluster_recall": self.cluster_recall,
+            "cluster_false_positives": self.cluster_false_positives,
+            "evidence_violations": self.evidence_violations,
+            "reason_violations": self.reason_violations,
+            "reconciliation_complete": self.reconciliation_complete,
+            "stage_sequence": list(self.stage_sequence),
+            "expected_ordering": list(self.expected_ordering),
             "retained_signals": [
                 {
                     "runtime": signal.runtime,
@@ -368,48 +401,6 @@ def _batch_coverage(manifests: Mapping[Runtime, object]) -> tuple[bool, int, tup
     return complete, failures, tuple(sorted(report_counts))
 
 
-def _score_ranking(signals: Iterable[tuple[Runtime, Signal]]) -> tuple[str, ...]:
-    values = tuple(signals)
-    type_map = {
-        "user": FindingType.CORRECTION,
-        "error": FindingType.FAILURE,
-        "interrupt": FindingType.FRICTION,
-    }
-    findings: list[Finding] = []
-    for index, (runtime, signal) in enumerate(values):
-        finding_type = type_map[signal.kind.value]
-        findings.append(
-            Finding(
-                cluster_key=f"{runtime.value}-{signal.session_id}-{signal.source_line}-{signal.kind.value}",
-                finding_type=finding_type,
-                session_id=signal.session_id,
-                paraphrase=signal.text,
-                occurrence_count=1,
-                confidence=1.0,
-                evidence=(
-                    EvidenceRef(
-                        digest_path=f"synthetic-{index}.md",
-                        source_line=signal.source_line,
-                        timestamp=signal.timestamp,
-                        kind=finding_type,
-                        project="synthetic-project",
-                    ),
-                ),
-            )
-        )
-    candidates = []
-    for finding in findings:
-        metrics = compute_metrics(
-            (finding,),
-            analyzed_sessions=len({item.session_id for unused_runtime, item in values}),
-            regression_count=0,
-            confidence=finding.confidence,
-            implementation_cost="S",
-        )
-        candidates.append(score_candidate(finding.cluster_key, metrics))
-    return tuple(item.cluster_key for item in rank_candidates(candidates))
-
-
 def _interleave_signals(signals: Iterable[tuple[Runtime, Signal]]) -> tuple[tuple[Runtime, Signal], ...]:
     values = tuple(signals)
     grouped = {
@@ -456,6 +447,481 @@ def _normalized_signals(signals: Iterable[tuple[Runtime, Signal]]) -> tuple[Norm
             key=lambda signal: (signal.runtime, signal.session_id, signal.source_line, signal.kind),
         )
     )
+
+
+def _stage_semantic_runtime(fixtures: Path, runtime: Runtime, root: Path) -> Path:
+    """Stage the semantic corpus into a runtime-shaped source tree."""
+    source_dir = fixtures / "semantic" / runtime.value
+    if runtime is Runtime.CLAUDE:
+        source_root = root / "projects"
+        for project_dir in sorted(source_dir.iterdir()):
+            if not project_dir.is_dir():
+                continue
+            for session_file in sorted(project_dir.iterdir()):
+                if session_file.suffix != ".jsonl":
+                    continue
+                relative = session_file.relative_to(source_dir)
+                target = source_root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                _copy_with_mtime(session_file, target, _RECENT_MTIME)
+    else:
+        source_root = root / "sessions"
+        for session_file in sorted(source_dir.rglob("*.jsonl")):
+            relative = session_file.relative_to(source_dir)
+            target = source_root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            _copy_with_mtime(session_file, target, _RECENT_MTIME)
+    return source_root
+
+
+def _semantic_expected(fixtures: Path) -> dict[str, object]:
+    path = fixtures / "semantic" / "semantic-expected.json"
+    with path.open("r", encoding="utf-8") as stream:
+        value = json.load(stream)
+    if not isinstance(value, dict):
+        raise ValueError("semantic-expected.json must contain an object")
+    return value
+
+
+def _golden_findings(fixtures: Path) -> dict[str, object]:
+    path = fixtures / "semantic" / "golden" / "miner-findings.json"
+    with path.open("r", encoding="utf-8") as stream:
+        value = json.load(stream)
+    if not isinstance(value, dict):
+        raise ValueError("golden miner-findings.json must contain an object")
+    return value
+
+
+def _golden_tampered(fixtures: Path) -> dict[str, object]:
+    path = fixtures / "semantic" / "golden" / "tampered-findings.json"
+    with path.open("r", encoding="utf-8") as stream:
+        value = json.load(stream)
+    if not isinstance(value, dict):
+        raise ValueError("golden tampered-findings.json must contain an object")
+    return value
+
+
+def _golden_groups(fixtures: Path) -> dict[str, object]:
+    path = fixtures / "semantic" / "golden" / "reconciliation-groups.json"
+    with path.open("r", encoding="utf-8") as stream:
+        value = json.load(stream)
+    if not isinstance(value, dict):
+        raise ValueError("golden reconciliation-groups.json must contain an object")
+    return value
+
+
+def _digest_signal_lines(digest_path: Path) -> list[dict[str, Any]]:
+    values = []
+    with digest_path.open("r", encoding="utf-8") as stream:
+        for raw_line in stream:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            try:
+                value = json.loads(line)
+            except (json.JSONDecodeError, ValueError, TypeError):
+                continue
+            if isinstance(value, dict) and "source_line" in value:
+                values.append(value)
+    return values
+
+
+def _session_id_for_source(manifest, source_path: str) -> str:
+    for source in manifest.source_files:
+        if source.source_path == source_path:
+            return source.evidence_index[0].session_id if source.evidence_index else ""
+    return ""
+
+
+def _build_semantic_reports(
+    runtime: Runtime,
+    manifest,
+    plan: DispatchPlan,
+    fixtures: Path,
+    tamper: bool,
+) -> tuple[MinerReport, ...]:
+    """Build golden miner reports for every planned batch.
+
+    With ``tamper=True`` the tampered session's finding cites a fabricated
+    source line so the report must fail closed during validation.
+    """
+    golden = _golden_findings(fixtures)
+    tampered = _golden_tampered(fixtures)
+    raw_by_runtime = golden.get(runtime.value)
+    if not isinstance(raw_by_runtime, dict):
+        raise ValueError(f"golden findings missing runtime {runtime.value}")
+    tampered_by_runtime = tampered.get(runtime.value)
+    if not isinstance(tampered_by_runtime, dict):
+        raise ValueError(f"tampered findings missing runtime {runtime.value}")
+    source_by_digest = {
+        source.digest_path: source
+        for source in manifest.source_files
+        if source.digest_path is not None
+    }
+    reports = []
+    for batch in plan.batches:
+        findings = []
+        for digest_path in batch.digest_paths:
+            source = source_by_digest[digest_path]
+            spec = raw_by_runtime.get(source.source_path)
+            if spec is None:
+                continue
+            if isinstance(spec, dict) and "findings" in spec and not spec["findings"]:
+                continue
+            if not isinstance(spec, dict) or "cluster_key" not in spec:
+                continue
+            tampered_spec = tampered_by_runtime.get(source.source_path)
+            if tamper and tampered_spec is not None:
+                spec = tampered_spec
+            session_id = _session_id_for_source(manifest, source.source_path)
+            digest_lines = _digest_signal_lines(Path(digest_path))
+            evidence = []
+            for line in digest_lines:
+                if line["source_line"] not in spec["evidence_lines"]:
+                    continue
+                evidence.append(
+                    {
+                        "digest_path": digest_path,
+                        "source_line": line["source_line"],
+                        "timestamp": line["timestamp"],
+                        "kind": spec["finding_type"],
+                        "project": line["project"],
+                        "occurrence_count": 1,
+                    }
+                )
+            if not evidence and tampered_spec is not None and digest_lines:
+                # Fabricate a citation for a source line that was never
+                # retained, so the report must fail closed on validation.
+                base = digest_lines[0]
+                evidence.append(
+                    {
+                        "digest_path": digest_path,
+                        "source_line": spec["evidence_lines"][0],
+                        "timestamp": base["timestamp"],
+                        "kind": spec["finding_type"],
+                        "project": base["project"],
+                        "occurrence_count": 1,
+                    }
+                )
+            if not evidence:
+                raise ValueError(
+                    f"golden findings for {source.source_path} cite no retained signal"
+                )
+            findings.append(
+                Finding(
+                    cluster_key=spec["cluster_key"],
+                    finding_type=FindingType(spec["finding_type"]),
+                    session_id=session_id,
+                    paraphrase=spec["paraphrase"],
+                    occurrence_count=len(evidence),
+                    confidence=0.9,
+                    evidence=tuple(
+                        EvidenceRef(
+                            digest_path=item["digest_path"],
+                            source_line=item["source_line"],
+                            timestamp=datetime.fromisoformat(
+                                item["timestamp"].replace("Z", "+00:00")
+                            ),
+                            kind=FindingType(item["kind"]),
+                            project=item["project"],
+                            occurrence_count=item["occurrence_count"],
+                        )
+                        for item in evidence
+                    ),
+                )
+            )
+        reports.append(
+            MinerReport(
+                schema_version=1,
+                runtime=runtime,
+                run_id=manifest.run_id,
+                batch_id=batch.batch_id,
+                digest_paths=batch.digest_paths,
+                findings=tuple(findings),
+                themes=(),
+            )
+        )
+    return tuple(reports)
+
+
+def _write_semantic_reports(
+    reports: tuple[MinerReport, ...],
+    plan: DispatchPlan,
+) -> None:
+    for report in reports:
+        path = Path(report.digest_paths[0]).parent if report.digest_paths else None
+        for batch in plan.batches:
+            if batch.batch_id == report.batch_id:
+                target = Path(batch.report_path)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "runtime": report.runtime.value,
+                            "run_id": report.run_id,
+                            "batch_id": report.batch_id,
+                            "digest_paths": list(report.digest_paths),
+                            "findings": [
+                                {
+                                    "cluster_key": finding.cluster_key,
+                                    "finding_type": finding.finding_type.value,
+                                    "session_id": finding.session_id,
+                                    "paraphrase": finding.paraphrase,
+                                    "occurrence_count": finding.occurrence_count,
+                                    "confidence": finding.confidence,
+                                    "evidence": [
+                                        {
+                                            "digest_path": ref.digest_path,
+                                            "source_line": ref.source_line,
+                                            "timestamp": ref.timestamp.astimezone(UTC).isoformat().replace("+00:00", "Z"),
+                                            "kind": ref.kind.value,
+                                            "project": ref.project,
+                                            "occurrence_count": ref.occurrence_count,
+                                        }
+                                        for ref in finding.evidence
+                                    ],
+                                }
+                                for finding in report.findings
+                            ],
+                            "themes": list(report.themes),
+                        },
+                        sort_keys=True,
+                        indent=2,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                break
+
+
+def _write_semantic_reconciliation(
+    out_dir: Path,
+    request,
+    findings: tuple[Finding, ...],
+    fixtures: Path,
+) -> None:
+    groups = _golden_groups(fixtures)
+    raw_groups = groups.get("groups")
+    if not isinstance(raw_groups, list):
+        raise ValueError("golden reconciliation groups must be an array")
+    by_session = {
+        finding.session_id: finding_id(finding, request.runtime)
+        for finding in findings
+    }
+    report_groups = []
+    for raw in raw_groups:
+        if not isinstance(raw, dict):
+            raise ValueError("golden reconciliation group must be an object")
+        member_ids = []
+        for session_id in raw["sessions"]:
+            finding_id_value = by_session.get(session_id)
+            if finding_id_value is None:
+                raise ValueError(f"golden group references unknown session {session_id}")
+            member_ids.append(finding_id_value)
+        report_groups.append(
+            ReconciliationGroup(
+                raw["cluster_key"],
+                raw["summary"],
+                raw["rationale"],
+                tuple(member_ids),
+            )
+        )
+    report = ReconciliationReport(1, request.runtime, request.run_id, tuple(report_groups))
+    (out_dir / "reconciliation-report.json").write_text(
+        json.dumps(report.to_json(), sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _semantic_run(
+    fixtures: Path,
+    runtime: Runtime,
+    root: Path,
+    tamper: bool,
+) -> tuple[tuple[str, ...], tuple[CandidateScore, ...], tuple[Finding, ...], bool]:
+    """Drive one runtime through the complete staged workflow.
+
+    With ``tamper=True`` the tampered report must fail closed during
+    validation, proving the evidence checks reject fabricated citations.
+    """
+    source_root = _stage_semantic_runtime(fixtures, runtime, root / runtime.value)
+    spec = resolve_runtime(runtime.value, home=root / runtime.value, env={}, source_root=source_root)
+    scope = Scope(_timestamp(_semantic_expected(fixtures)["window_since"]), None, False)
+    out_dir = root / f"semantic-{runtime.value}"
+    try:
+        manifest = run_digest(spec, scope, out_dir)
+    except IncompleteDigestError as exc:
+        manifest = exc.manifest
+    if not manifest.complete:
+        raise ValueError(f"semantic manifest for {runtime.value} is incomplete")
+    from reflect_setup import _build_dispatch_plan, _load_plan_reports, _validate_dispatch_plan
+
+    plan = _build_dispatch_plan(manifest, out_dir, 8)
+    (out_dir / "dispatch-plan.json").write_text(
+        json.dumps(plan.to_json(), sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    _validate_dispatch_plan(plan, manifest, out_dir, 8)
+    reports = _build_semantic_reports(runtime, manifest, plan, fixtures, tamper)
+    _write_semantic_reports(reports, plan)
+    if tamper:
+        try:
+            _load_plan_reports(plan, manifest, out_dir)
+        except ReportValidationError:
+            return (
+                (RunStage.AWAITING_MINERS.value,),
+                (),
+                (),
+                True,
+            )
+        raise ValueError("tampered miner report must fail closed during validation")
+    loaded = _load_plan_reports(plan, manifest, out_dir)
+    findings = merge_reports(loaded, manifest)
+
+    from reflect_setup import _rank_grouped
+
+    if len(findings) > 1:
+        request = build_request(findings, runtime=runtime, run_id=manifest.run_id)
+        (out_dir / "reconciliation-request.json").write_text(
+            json.dumps(request.to_json(), sort_keys=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        _write_semantic_reconciliation(out_dir, request, findings, fixtures)
+        from reconciliation import parse_request as parse_req
+
+        persisted_request = parse_req((out_dir / "reconciliation-request.json").read_text(encoding="utf-8"))
+        report = parse_reconciliation_report(
+            (out_dir / "reconciliation-report.json").read_text(encoding="utf-8"),
+            persisted_request,
+        )
+        groups = validate_groups(report, persisted_request)
+        by_id = {finding_id(finding, runtime): finding for finding in findings}
+        grouped = {}
+        for group in groups:
+            grouped[group.cluster_key] = tuple(
+                by_id[finding_id_value] for finding_id_value in group.member_finding_ids
+            )
+    else:
+        grouped = {findings[0].cluster_key: findings} if findings else {}
+    ranked = _rank_grouped(grouped, len(manifest.source_files), {})
+    stage_sequence = (
+        RunStage.AWAITING_MINERS.value,
+        RunStage.AWAITING_RECONCILIATION.value,
+        RunStage.DIAGNOSIS_COMPLETE.value,
+    )
+    return stage_sequence, ranked, findings, True
+
+
+def _semantic_evaluation(fixtures: Path) -> dict[str, object]:
+    expected = _semantic_expected(fixtures)
+    raw_clusters = expected.get("expected_clusters")
+    if not isinstance(raw_clusters, list):
+        raise ValueError("expected_clusters must be an array")
+    expected_clusters = tuple(raw_clusters)
+    expected_ordering = tuple(expected.get("expected_ordering", []))
+    excluded_sessions = set(expected.get("excluded_sessions", []))
+    tampered_session = expected.get("tampered_session")
+    unreadable_session = expected.get("unreadable_session")
+    subagent_session = expected.get("subagent_session")
+    include_subagents = bool(expected.get("include_subagents"))
+
+    with tempfile.TemporaryDirectory(prefix="reflect-semantic-") as raw:
+        root = Path(raw)
+        honest_results = {}
+        tampered_results = {}
+        for runtime in (Runtime.CLAUDE, Runtime.CODEX):
+            honest_results[runtime] = _semantic_run(fixtures, runtime, root / "honest", False)
+            tampered_results[runtime] = _semantic_run(fixtures, runtime, root / "tampered", True)
+
+    all_ranked = []
+    all_findings = []
+    for runtime in (Runtime.CLAUDE, Runtime.CODEX):
+        stage_sequence, ranked, findings, complete = honest_results[runtime]
+        all_ranked.extend(ranked)
+        all_findings.extend(findings)
+    by_key: dict[str, CandidateScore] = {}
+    for candidate in all_ranked:
+        by_key.setdefault(candidate.cluster_key, candidate)
+    ranked = tuple(
+        sorted(
+            by_key.values(),
+            key=lambda candidate: (
+                -candidate.score,
+                -min(candidate.metrics.regression_count, 1),
+                candidate.metrics.first_seen,
+                candidate.cluster_key,
+            ),
+        )
+    )
+
+    expected_by_key = {item["cluster_key"]: item for item in expected_clusters}
+    predicted_by_key = {candidate.cluster_key: candidate for candidate in ranked}
+    true_positives = sum(
+        1 for key in expected_by_key if key in predicted_by_key
+    )
+    cluster_precision = round(true_positives / len(predicted_by_key), 10) if predicted_by_key else 0.0
+    cluster_recall = round(true_positives / len(expected_by_key), 10) if expected_by_key else 1.0
+    cluster_false_positives = len(predicted_by_key) - true_positives
+
+    evidence_violations = 0
+    for key, candidate in predicted_by_key.items():
+        expected_item = expected_by_key.get(key)
+        if expected_item is None:
+            continue
+        expected_sessions = set(expected_item["sessions"])
+        actual_sessions = {item.session_id for item in candidate.evidence}
+        if actual_sessions != expected_sessions:
+            evidence_violations += 1
+        expected_projects = set(expected_item["projects"])
+        actual_projects = {item.project for item in candidate.evidence}
+        if actual_projects != expected_projects:
+            evidence_violations += 1
+        if len(candidate.evidence) != expected_item["evidence_count"]:
+            evidence_violations += 1
+        if tuple(candidate.finding_types) != tuple(sorted(expected_item["finding_types"])):
+            evidence_violations += 1
+
+    reason_violations = 0
+    for runtime in (Runtime.CLAUDE, Runtime.CODEX):
+        stage_sequence, ranked_run, findings, complete = honest_results[runtime]
+        for finding in findings:
+            if finding.session_id in excluded_sessions:
+                reason_violations += 1
+    for runtime in (Runtime.CLAUDE, Runtime.CODEX):
+        stage_sequence, ranked_run, findings, complete = tampered_results[runtime]
+        for finding in findings:
+            if finding.session_id == tampered_session:
+                reason_violations += 1
+
+    reconciliation_complete = all(
+        honest_results[runtime][3] for runtime in (Runtime.CLAUDE, Runtime.CODEX)
+    )
+    stage_sequence = honest_results[Runtime.CLAUDE][0]
+    expected_sequence = (
+        RunStage.AWAITING_MINERS.value,
+        RunStage.AWAITING_RECONCILIATION.value,
+        RunStage.DIAGNOSIS_COMPLETE.value,
+    )
+    ordering_matches = tuple(candidate.cluster_key for candidate in ranked) == expected_ordering
+    return {
+        "cluster_precision": cluster_precision,
+        "cluster_recall": cluster_recall,
+        "cluster_false_positives": cluster_false_positives,
+        "evidence_violations": evidence_violations,
+        "reason_violations": reason_violations,
+        "reconciliation_complete": reconciliation_complete,
+        "stage_sequence": stage_sequence,
+        "expected_sequence": expected_sequence,
+        "ordering_matches": ordering_matches,
+        "expected_ordering": expected_ordering,
+        "ranking": tuple(candidate.cluster_key for candidate in ranked),
+        "excluded_sessions": tuple(sorted(excluded_sessions)),
+        "tampered_session": tampered_session,
+        "unreadable_session": unreadable_session,
+        "subagent_session": subagent_session,
+        "include_subagents": include_subagents,
+    }
 
 
 def evaluate_fixtures(fixtures: Path) -> EvaluationResult:
@@ -515,9 +981,18 @@ def evaluate_fixtures(fixtures: Path) -> EvaluationResult:
     )
     malformed_cases_checked = _check_malformed_fixtures(fixtures, scope)
     batch_coverage_complete, batch_failures, batch_report_counts = _batch_coverage(manifests)
-    ranking = _score_ranking(all_signals)
-    fresh_ranking = _score_ranking(fresh_signals)
-    reordered_ranking = _score_ranking(_interleave_signals(all_signals))
+    ranking = tuple(
+        candidate.cluster_key
+        for candidate in _rank_signal_candidates(all_signals)
+    )
+    fresh_ranking = tuple(
+        candidate.cluster_key
+        for candidate in _rank_signal_candidates(fresh_signals)
+    )
+    reordered_ranking = tuple(
+        candidate.cluster_key
+        for candidate in _rank_signal_candidates(_interleave_signals(all_signals))
+    )
     raw_expected_ranking = expected.get("expected_ranking")
     if not isinstance(raw_expected_ranking, list) or not all(isinstance(item, str) for item in raw_expected_ranking):
         raise ValueError("expected_ranking must be an array of strings")
@@ -547,6 +1022,17 @@ def evaluate_fixtures(fixtures: Path) -> EvaluationResult:
         and subagents_filtered
         and malformed_cases_checked
     )
+    semantic = _semantic_evaluation(fixtures)
+    expected_matches = expected_matches and (
+        semantic["cluster_precision"] == 1.0
+        and semantic["cluster_recall"] == 1.0
+        and semantic["cluster_false_positives"] == 0
+        and semantic["evidence_violations"] == 0
+        and semantic["reason_violations"] == 0
+        and semantic["reconciliation_complete"]
+        and semantic["stage_sequence"] == semantic["expected_sequence"]
+        and semantic["ordering_matches"]
+    )
     return EvaluationResult(
         precision=precision,
         recall=recall,
@@ -564,7 +1050,58 @@ def evaluate_fixtures(fixtures: Path) -> EvaluationResult:
         malformed_lines=malformed_lines,
         batch_report_counts=batch_report_counts,
         ranking=ranking,
+        cluster_precision=semantic["cluster_precision"],
+        cluster_recall=semantic["cluster_recall"],
+        cluster_false_positives=semantic["cluster_false_positives"],
+        evidence_violations=semantic["evidence_violations"],
+        reason_violations=semantic["reason_violations"],
+        reconciliation_complete=semantic["reconciliation_complete"],
+        stage_sequence=semantic["stage_sequence"],
+        expected_ordering=semantic["expected_ordering"],
     )
+
+
+def _rank_signal_candidates(signals: Iterable[tuple[Runtime, Signal]]) -> tuple[CandidateScore, ...]:
+    """Rank retained signals as one-finding candidates for determinism checks."""
+    from scoring import compute_metrics, score_candidate
+
+    values = tuple(signals)
+    type_map = {
+        "user": FindingType.CORRECTION,
+        "error": FindingType.FAILURE,
+        "interrupt": FindingType.FRICTION,
+    }
+    findings: list[Finding] = []
+    for index, (runtime, signal) in enumerate(values):
+        finding_type = type_map[signal.kind.value]
+        findings.append(
+            Finding(
+                cluster_key=f"{runtime.value}-{signal.session_id}-{signal.source_line}-{signal.kind.value}",
+                finding_type=finding_type,
+                session_id=signal.session_id,
+                paraphrase=signal.text,
+                occurrence_count=1,
+                confidence=1.0,
+                evidence=(
+                    EvidenceRef(
+                        digest_path=f"synthetic-{index}.md",
+                        source_line=signal.source_line,
+                        timestamp=signal.timestamp,
+                        kind=finding_type,
+                        project="synthetic-project",
+                    ),
+                ),
+            )
+        )
+    candidates = []
+    for finding in findings:
+        metrics = compute_metrics(
+            (finding,),
+            analyzed_sessions=len({item.session_id for unused_runtime, item in values}),
+            regression_count=0,
+        )
+        candidates.append(score_candidate(finding.cluster_key, finding.paraphrase, (finding,), metrics))
+    return rank_candidates(candidates)
 
 
 def main(argv: list[str] | None = None) -> int:
