@@ -1,0 +1,18 @@
+{
+  "claude": {
+    "semantic-project-g/tampered.jsonl": {
+      "cluster_key": "retry hook failure",
+      "finding_type": "failure",
+      "paraphrase": "The retry hook keeps failing.",
+      "evidence_lines": [99]
+    }
+  },
+  "codex": {
+    "tampered.jsonl": {
+      "cluster_key": "retry hook failure",
+      "finding_type": "failure",
+      "paraphrase": "The retry hook keeps failing.",
+      "evidence_lines": [99]
+    }
+  }
+}

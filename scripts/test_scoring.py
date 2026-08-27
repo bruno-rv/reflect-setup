@@ -16,8 +16,6 @@ def test_metrics_include_rate_breadth_and_regression():
         ),
         analyzed_sessions=10,
         regression_count=1,
-        confidence=0.8,
-        implementation_cost="M",
     )
     assert metrics.occurrences_per_100_sessions == 50.0
     assert metrics.sessions == 3
@@ -46,11 +44,9 @@ def test_score_uses_transparent_formula_and_rationale():
         ),
         analyzed_sessions=10,
         regression_count=1,
-        confidence=0.8,
-        implementation_cost="M",
     )
-    candidate = score_candidate("fixture", metrics)
-    assert candidate.score == 0.59
+    candidate = score_candidate("fixture", "fixture failure", make_findings(5, ("s1", "s2", "s3"), ("p1", "p2"), ("2026-08-20", "2026-08-23")), metrics)
+    assert candidate.score == 0.71
     assert any("occurrences" in item for item in candidate.rationale)
     assert any("regression" in item for item in candidate.rationale)
     assert any("raw metrics" in item for item in candidate.rationale)
@@ -66,8 +62,6 @@ def test_zero_analyzed_sessions_produce_zero_rate_without_division_error():
         ),
         analyzed_sessions=0,
         regression_count=0,
-        confidence=0.5,
-        implementation_cost="S",
     )
     assert metrics.occurrences_per_100_sessions == 0.0
 
@@ -82,26 +76,46 @@ def test_confidence_at_input_boundary_is_preserved():
         ),
         analyzed_sessions=1,
         regression_count=0,
-        confidence=1.0,
-        implementation_cost="S",
     )
     assert 0.0 <= metrics.confidence <= 1.0
-    assert metrics.confidence == 1.0
+    assert metrics.confidence == 0.8
 
 
-def test_invalid_confidence_is_rejected():
-    try:
-        compute_metrics(
-            findings=make_findings(1, ("s1",), ("p1",), ("2026-08-23",)),
-            analyzed_sessions=1,
-            regression_count=0,
-            confidence=1.1,
-            implementation_cost="S",
-        )
-    except ValueError as exc:
-        assert "confidence" in str(exc)
-    else:
-        raise AssertionError("confidence outside [0, 1] must be rejected")
+def test_confidence_is_occurrence_weighted_mean_of_findings():
+    from miner_contract import EvidenceRef, Finding, FindingType
+
+    findings = (
+        Finding(
+            cluster_key="weighted",
+            finding_type=FindingType.FAILURE,
+            session_id="s1",
+            paraphrase="fixture",
+            occurrence_count=3,
+            confidence=1.0,
+            evidence=(
+                EvidenceRef(
+                    "a.md", 1, datetime(2026, 8, 23, tzinfo=timezone.utc),
+                    FindingType.FAILURE, "p1", occurrence_count=3,
+                ),
+            ),
+        ),
+        Finding(
+            cluster_key="weighted",
+            finding_type=FindingType.FAILURE,
+            session_id="s2",
+            paraphrase="fixture",
+            occurrence_count=1,
+            confidence=0.0,
+            evidence=(
+                EvidenceRef(
+                    "b.md", 1, datetime(2026, 8, 23, tzinfo=timezone.utc),
+                    FindingType.FAILURE, "p2", occurrence_count=1,
+                ),
+            ),
+        ),
+    )
+    metrics = compute_metrics(findings, 2, 0)
+    assert metrics.confidence == 0.75
 
 
 def test_impact_averages_mixed_finding_types():
@@ -129,7 +143,7 @@ def test_impact_averages_mixed_finding_types():
             (FindingType.FAILURE, FindingType.COMPLAINT, FindingType.CORRECTION, FindingType.FRICTION)
         )
     )
-    metrics = compute_metrics(findings, 4, 0, 0.5, "L")
+    metrics = compute_metrics(findings, 4, 0)
     assert metrics.impact == 0.85
 
 
@@ -172,7 +186,7 @@ def test_explicit_project_identity_handles_double_underscore_names():
             ),
         ),
     )
-    metrics = compute_metrics(findings, 2, 0, 0.9, "S")
+    metrics = compute_metrics(findings, 2, 0)
     assert metrics.projects == 1
 
 
@@ -204,26 +218,52 @@ def test_utc_boundary_normalizes_dates_before_counting():
             )
         )
     )
-    metrics = compute_metrics(findings, 2, 0, 0.5, "S")
+    metrics = compute_metrics(findings, 2, 0)
     assert metrics.distinct_days == 1
     assert metrics.first_seen == datetime(2026, 8, 23, 0, 15, tzinfo=timezone.utc)
 
 
 def test_zero_occurrences_with_regression_do_not_divide_by_zero():
-    metrics = compute_metrics((), 0, 1, 0.5, "S")
-    candidate = score_candidate("zero-occurrence", metrics)
+    metrics = compute_metrics((), 0, 1)
+    candidate = score_candidate("zero-occurrence", "fixture", make_findings(1, ("s1",), ("p1",), ("2026-08-23",)), metrics)
     assert metrics.occurrences == 0
-    assert candidate.score == -0.05
+    assert candidate.score == 0.1
 
 
-def test_implementation_cost_breaks_equal_score_ties_before_cluster_key():
-    metrics = compute_metrics(make_findings(1, ("s1",), ("p1",), ("2026-08-23",)), 1, 0, 0.5, "S")
-    from scoring import rank_candidates
+def test_regression_is_a_priority_bonus_not_a_penalty():
+    base = make_findings(1, ("s1",), ("p1",), ("2026-08-23",))
+    without = score_candidate("a", "fixture", base, compute_metrics(base, 1, 0))
+    with_regression = score_candidate("b", "fixture", base, compute_metrics(base, 1, 1))
+    assert with_regression.score > without.score
+    assert with_regression.score == round(without.score + 0.1, 4)
 
-    cheaper = score_candidate("z-cluster", replace(metrics, implementation_cost="S"))
-    more_expensive = score_candidate("a-cluster", replace(metrics, implementation_cost="L"))
-    ranked = rank_candidates((more_expensive, cheaper))
-    assert [item.cluster_key for item in ranked] == ["z-cluster", "a-cluster"]
+
+def test_regression_tie_break_prefers_regressed_candidate():
+    base = make_findings(1, ("s1",), ("p1",), ("2026-08-23",))
+    regressed = score_candidate("regressed", "fixture", base, compute_metrics(base, 1, 1))
+    clean = score_candidate("clean", "fixture", base, compute_metrics(base, 1, 0))
+    ranked = rank_candidates((clean, regressed))
+    assert [item.cluster_key for item in ranked] == ["regressed", "clean"]
+
+
+def test_candidate_evidence_is_deduplicated_and_sorted():
+    from miner_contract import EvidenceRef, Finding, FindingType
+
+    ref = EvidenceRef(
+        "a.md", 1, datetime(2026, 8, 23, tzinfo=timezone.utc),
+        FindingType.FAILURE, "p1",
+    )
+    findings = (
+        Finding("dup", FindingType.FAILURE, "s1", "fixture", 1, 0.5, (ref,)),
+        Finding("dup", FindingType.FAILURE, "s1", "fixture", 1, 0.5, (ref,)),
+    )
+    metrics = compute_metrics(findings, 1, 0)
+    candidate = score_candidate("dup", "fixture", findings, metrics)
+    assert len(candidate.evidence) == 1
+    assert candidate.evidence[0].session_id == "s1"
+    assert candidate.evidence[0].digest_path == "a.md"
+    assert candidate.finding_types == ("failure",)
+    assert candidate.paraphrases == ("fixture",)
 
 
 def run_all():

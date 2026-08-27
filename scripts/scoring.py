@@ -5,15 +5,12 @@ import math
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Iterable, Literal
+from typing import Callable, Iterable
 
-from miner_contract import EvidenceRef, Finding, FindingType
+from miner_contract import EvidenceRef, Finding, FindingType, normalize_cluster_key
 
 
 UTC = timezone.utc
-ImplementationCost = Literal["S", "M", "L"]
-_IMPLEMENTATION_COSTS = frozenset(("S", "M", "L"))
-_IMPLEMENTATION_COST_ORDER = {"S": 0, "M": 1, "L": 2}
 _IMPACT_WEIGHTS: dict[FindingType, float] = {
     FindingType.FAILURE: 1.0,
     FindingType.COMPLAINT: 0.9,
@@ -31,6 +28,24 @@ def _frozen_dataclass(cls):
 
 
 @_frozen_dataclass
+class CandidateEvidence:
+    """Report-view evidence that retains its owning session.
+
+    This is a derived view of validated miner evidence: the session identity
+    comes from the finding, while the remaining fields are copied from the
+    manifest-bound ``EvidenceRef``.
+    """
+
+    session_id: str
+    digest_path: str
+    source_line: int
+    timestamp: datetime
+    kind: FindingType
+    project: str
+    occurrence_count: int
+
+
+@_frozen_dataclass
 class TrendMetrics:
     occurrences: int
     sessions: int
@@ -43,12 +58,15 @@ class TrendMetrics:
     regression_count: int
     confidence: float
     impact: float
-    implementation_cost: ImplementationCost
 
 
 @_frozen_dataclass
 class CandidateScore:
     cluster_key: str
+    summary: str
+    finding_types: tuple[str, ...]
+    paraphrases: tuple[str, ...]
+    evidence: tuple[CandidateEvidence, ...]
     score: float
     metrics: TrendMetrics
     rationale: tuple[str, ...]
@@ -69,12 +87,6 @@ def _confidence(value: object) -> float:
     if not 0.0 <= value <= 1.0:
         raise ValueError("confidence must be a number between 0 and 1")
     return value
-
-
-def _implementation_cost(value: object) -> ImplementationCost:
-    if value not in _IMPLEMENTATION_COSTS:
-        raise ValueError("implementation_cost must be one of: S, M, L")
-    return value  # type: ignore[return-value]
 
 
 def _utc_timestamp(value: datetime) -> datetime:
@@ -104,29 +116,42 @@ def _finding_values(findings: Iterable[Finding]) -> tuple[Finding, ...]:
     return values
 
 
+def _occurrence_weighted_mean(
+    values: tuple[Finding, ...],
+    value_of: Callable[[Finding], float],
+) -> float:
+    total_occurrences = sum(finding.occurrence_count for finding in values)
+    if total_occurrences <= 0:
+        return 0.0
+    weighted = sum(
+        finding.occurrence_count * value_of(finding)
+        for finding in values
+    )
+    return round(weighted / total_occurrences, 4)
+
+
 def compute_metrics(
     findings: Iterable[Finding],
     analyzed_sessions: int,
     regression_count: int,
-    confidence: float,
-    implementation_cost: ImplementationCost,
 ) -> TrendMetrics:
-    """Compute normalized, runtime-neutral metrics for one merged cluster."""
+    """Compute normalized, runtime-neutral metrics for one merged cluster.
+
+    Confidence and impact are derived from the grouped findings themselves
+    (occurrence-weighted means) rather than supplied by the caller, so a
+    ranking cannot be steered by invented confidence or cost values.
+    """
     values = _finding_values(findings)
     analyzed_sessions = _nonnegative_integer(analyzed_sessions, "analyzed_sessions")
     regression_count = _nonnegative_integer(regression_count, "regression_count")
-    confidence = _confidence(confidence)
-    implementation_cost = _implementation_cost(implementation_cost)
 
     timestamps: list[datetime] = []
     sessions: set[str] = set()
     projects: set[str] = set()
-    finding_types: list[FindingType] = []
     occurrences = 0
     for finding in values:
         occurrences += finding.occurrence_count
         sessions.add(finding.session_id)
-        finding_types.append(finding.finding_type)
         for evidence in finding.evidence:
             timestamps.append(_utc_timestamp(evidence.timestamp))
             projects.add(evidence.project)
@@ -137,14 +162,13 @@ def compute_metrics(
     occurrences_per_100_sessions = (
         round(occurrences * 100.0 / analyzed_sessions, 4) if analyzed_sessions else 0.0
     )
-    impact = (
-        round(
-            sum(_IMPACT_WEIGHTS[finding_type] for finding_type in finding_types)
-            / len(finding_types),
-            4,
-        )
-        if finding_types
-        else 0.0
+    confidence = _occurrence_weighted_mean(
+        values,
+        lambda finding: _confidence(finding.confidence),
+    )
+    impact = _occurrence_weighted_mean(
+        values,
+        lambda finding: _IMPACT_WEIGHTS[finding.finding_type],
     )
 
     return TrendMetrics(
@@ -159,7 +183,6 @@ def compute_metrics(
         regression_count=regression_count,
         confidence=confidence,
         impact=impact,
-        implementation_cost=implementation_cost,
     )
 
 
@@ -176,16 +199,61 @@ def _raw_metrics_rationale(metrics: TrendMetrics) -> str:
         f"first_seen={metrics.first_seen.isoformat()}, last_seen={metrics.last_seen.isoformat()}, "
         f"occurrences_per_100_sessions={metrics.occurrences_per_100_sessions}, "
         f"regression_count={metrics.regression_count}, confidence={metrics.confidence}, "
-        f"impact={metrics.impact}, implementation_cost={metrics.implementation_cost}"
+        f"impact={metrics.impact}"
     )
 
 
-def score_candidate(cluster_key: str, metrics: TrendMetrics) -> CandidateScore:
+def _candidate_evidence(values: tuple[Finding, ...]) -> tuple[CandidateEvidence, ...]:
+    """Derive deduplicated, session-bound report evidence for one cluster."""
+    seen: set[tuple[str, str, int]] = set()
+    items: list[CandidateEvidence] = []
+    for finding in values:
+        for ref in finding.evidence:
+            key = (finding.session_id, ref.digest_path, ref.source_line)
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append(
+                CandidateEvidence(
+                    session_id=finding.session_id,
+                    digest_path=ref.digest_path,
+                    source_line=ref.source_line,
+                    timestamp=_utc_timestamp(ref.timestamp),
+                    kind=ref.kind,
+                    project=ref.project,
+                    occurrence_count=ref.occurrence_count,
+                )
+            )
+    return tuple(
+        sorted(
+            items,
+            key=lambda item: (
+                item.timestamp,
+                item.project,
+                item.session_id,
+                item.digest_path,
+                item.source_line,
+            ),
+        )
+    )
+
+
+def score_candidate(
+    cluster_key: str,
+    summary: str,
+    findings: Iterable[Finding],
+    metrics: TrendMetrics,
+) -> CandidateScore:
     """Apply the fixed score formula and retain an auditable rationale."""
     if not isinstance(cluster_key, str) or not cluster_key.strip():
         raise ValueError("cluster_key must be a non-empty string")
+    if not isinstance(summary, str) or not summary.strip():
+        raise ValueError("summary must be a non-empty string")
     if not isinstance(metrics, TrendMetrics):
         raise TypeError("metrics must be a TrendMetrics value")
+    values = _finding_values(findings)
+    if not values:
+        raise ValueError("findings must contain at least one finding")
 
     occurrence_component = 0.30 * min(metrics.occurrences / 10, 1.0)
     session_component = 0.20 * min(metrics.sessions / 5, 1.0)
@@ -193,9 +261,7 @@ def score_candidate(cluster_key: str, metrics: TrendMetrics) -> CandidateScore:
     days_component = 0.15 * min(metrics.distinct_days / 5, 1.0)
     confidence_component = 0.10 * metrics.confidence
     impact_component = 0.10 * metrics.impact
-    regression_component = -0.10 * min(
-        metrics.regression_count / max(metrics.occurrences, 1), 1.0
-    )
+    regression_component = 0.10 * min(metrics.regression_count, 1)
     score = round(
         occurrence_component
         + session_component
@@ -221,20 +287,43 @@ def score_candidate(cluster_key: str, metrics: TrendMetrics) -> CandidateScore:
         if contribution:
             rationale.append(_component_rationale(name, raw_value, contribution))
     rationale.append(_raw_metrics_rationale(metrics))
-    return CandidateScore(cluster_key.strip(), score, metrics, tuple(rationale))
+    return CandidateScore(
+        cluster_key.strip(),
+        summary.strip(),
+        tuple(sorted({finding.finding_type.value for finding in values})),
+        tuple(sorted({finding.paraphrase for finding in values})),
+        _candidate_evidence(values),
+        score,
+        metrics,
+        tuple(rationale),
+    )
 
 
 def rank_candidates(candidates: Iterable[CandidateScore]) -> tuple[CandidateScore, ...]:
-    """Return candidates in a stable, score-first order."""
+    """Return candidates in a stable, score-first order.
+
+    A fix that failed in real use (a regression) rises rather than falls: the
+    regression bonus is already inside the score, and the tie-break prefers
+    the candidate with a regression before first-seen date.
+    """
     return tuple(
         sorted(
             candidates,
             key=lambda candidate: (
                 -candidate.score,
-                candidate.metrics.regression_count,
+                -min(candidate.metrics.regression_count, 1),
                 candidate.metrics.first_seen,
-                _IMPLEMENTATION_COST_ORDER[candidate.metrics.implementation_cost],
                 candidate.cluster_key,
             ),
         )
     )
+
+
+__all__ = [
+    "CandidateEvidence",
+    "CandidateScore",
+    "TrendMetrics",
+    "compute_metrics",
+    "rank_candidates",
+    "score_candidate",
+]

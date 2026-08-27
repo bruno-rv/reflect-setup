@@ -104,11 +104,13 @@ def _runtime_spec(runtime: Runtime, home: Path, env: Mapping[str, str], source_r
             base / "skills",
             base / "commands",
             base / "agents",
+            base / "hooks",
             base / "settings.json",
             base / "settings.local.json",
             Path(".claude/skills"),
             Path(".claude/commands"),
             Path(".claude/agents"),
+            Path(".claude/hooks"),
             Path(".claude/settings.json"),
             Path(".claude/settings.local.json"),
         )

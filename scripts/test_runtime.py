@@ -34,11 +34,13 @@ def test_claude_inventory_includes_global_and_project_locations():
             home / ".claude" / "skills",
             home / ".claude" / "commands",
             home / ".claude" / "agents",
+            home / ".claude" / "hooks",
             home / ".claude" / "settings.json",
             home / ".claude" / "settings.local.json",
             Path(".claude/skills"),
             Path(".claude/commands"),
             Path(".claude/agents"),
+            Path(".claude/hooks"),
             Path(".claude/settings.json"),
             Path(".claude/settings.local.json"),
         }

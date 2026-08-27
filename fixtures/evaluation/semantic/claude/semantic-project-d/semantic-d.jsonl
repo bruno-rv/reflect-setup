@@ -1,0 +1,2 @@
+{"type":"user","timestamp":"2026-08-23T13:00:00Z","message":{"role":"user","content":"The build failed because the cache is stale."}}
+{"type":"user","timestamp":"2026-08-23T13:01:00Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"build-tool-d","is_error":true,"content":"build failed: stale cache artifact"}]}}

@@ -3,9 +3,9 @@
 `reflect-setup` is one source-controlled, stdlib-only diagnostic skill for both
 Claude Code and Codex. It scans canonical user session transcripts for repeated
 corrections, friction, failures, complaints, and interrupts; validates
-evidence-backed miner reports; then ranks improvement candidates. Diagnosis
-does not edit projects. Apply is opt-in, per cluster, scope-bounded, and proof
-gated.
+evidence-backed miner reports; reconciles differently named findings; then
+ranks improvement candidates. Diagnosis does not edit projects. Apply is
+opt-in, per cluster, scope-bounded, and proof gated.
 
 ## Runtime support
 
@@ -56,23 +56,31 @@ PYTHONPATH=scripts python3 scripts/reflect_setup.py \
   --runtime auto --since 30 --out .reflect-setup-run
 ```
 
-When signal digests exist, the first phase writes `manifest.json` and stops
-until host miners return JSON reports. Resume against the same run directory:
+When signal digests exist, the first phase writes `manifest.json` and
+`dispatch-plan.json` and stops at `awaiting-miners`, printing the exact
+missing report paths. The host reads each `DispatchBatch` from the plan, sends
+its exact metadata plus `references/miner-prompt.md` to one worker, and writes
+the returned JSON to that batch's prescribed `miner-reports/<batch-id>.json`
+path. Rerun the exact same command:
 
 ```bash
 PYTHONPATH=scripts python3 scripts/reflect_setup.py \
-  --runtime claude --out .reflect-setup-run \
-  --miner-report .reflect-setup-run/miner-batch-a.json \
-  --miner-report .reflect-setup-run/miner-batch-b.json --json
+  --runtime claude --out .reflect-setup-run --json
 ```
 
-Reports must cover every non-empty digest path exactly once. Use
-`--include-subagents` to opt into sidechains. Apply additionally requires
-repeated `--approve-cluster ID` flags, an explicit `--ledger PATH` when ledger
-verification is wanted, and host-supplied typed request/workspace inputs. A
-bare CLI approval fails closed; the host performs fixer execution and notes or
-ledger updates after Python validates previews and optional `FixProof` values.
-Operating ledger `artifact_ids` use namespaced IDs such as
+The run advances only when every prescribed report exists. When more than one
+finding is merged, the run stops at `awaiting-reconciliation`; run one worker
+with `references/reconciler-prompt.md`, write its JSON to
+`reconciliation-report.json`, and rerun. Reports must cover every non-empty
+digest path exactly once, and the persisted plan is authoritative: a changed
+`--miner-batches`, changed manifest, changed digest bytes, or unplanned report
+file fails closed. Use `--include-subagents` to opt into sidechains. Apply
+additionally requires `--apply` plus a strict `--host-input PATH` file whose
+`apply` object carries the approved clusters, requests, workspaces, and
+optional proofs, and an explicit `--ledger PATH` when ledger verification is
+wanted. A bare CLI approval fails closed; the host performs fixer execution and
+notes or ledger updates after Python validates previews and optional
+`FixProof` values. Operating ledger `artifact_ids` use namespaced IDs such as
 `claude:project:.claude/skills/fixture/SKILL.md` or
 `codex:global:.codex/skills/fixture/SKILL.md`; migrate older unqualified IDs
 explicitly because they are not treated as aliases.
@@ -82,24 +90,26 @@ explicitly because they are not treated as aliases.
 Claude Code and Codex use the same sequence but their hosts choose their own
 available delegation mechanism:
 
-1. Delegate one bounded miner worker per digest batch and collect JSON reports.
-2. Collect typed `CoverageObservation` values (or validated coverage records)
+1. Delegate one bounded miner worker per dispatch batch and write each JSON
+   report to its prescribed `miner-reports/<batch-id>.json` path.
+2. Rerun the same command; when more than one finding exists, delegate one
+   reconciler worker with `references/reconciler-prompt.md` and write its JSON
+   to `reconciliation-report.json`.
+3. Collect typed `CoverageObservation` values (or validated coverage records)
    from host trigger/invocation and independent outcome evidence; do not infer
    eligibility from declared files.
-3. Resume `reflect_setup.py` with those reports and observations, then inspect
-   the ranked report.
-4. Ask for explicit consent per cluster. The host constructs an
-   `ApplyRequest`, `WorkspaceState`, and any host `CoverageObservation` values,
-   then calls `run_reflection(..., apply=True, approved_clusters=...,
-   apply_requests=..., apply_workspaces=...,
-   coverage_observations=...)` to obtain bounded previews.
-5. Execute only after preview consent, collect a `FixProof`, and call the API
-   with `apply_proofs=...`. The host then updates notes/ledger using its own
-   workflow.
+4. Rerun and inspect the ranked report.
+5. Ask for explicit consent per cluster. The host writes a strict
+   `--host-input` file with an `ApplyRequest`, `WorkspaceState`, and any host
+   `CoverageObservation` values, then reruns with `--apply` to obtain bounded
+   previews.
+6. Execute only after preview consent, collect a `FixProof`, and rerun with
+   the proof-bearing host input. The host then updates notes/ledger using its
+   own workflow.
 
-Claude uses its configured task/subagent delegation for steps 1 and 4; Codex
-uses its configured worker/subagent delegation. No unavailable tool name is
-assumed by the shared Python core.
+Claude uses its configured task/subagent delegation for steps 1, 2, and 5;
+Codex uses its configured worker/subagent delegation. No unavailable tool name
+is assumed by the shared Python core.
 
 ## Structure
 
@@ -107,14 +117,16 @@ assumed by the shared Python core.
 reflect-setup/
 ├── SKILL.md
 ├── REFERENCE.md
-├── references/miner-prompt.md
+├── references/miner-prompt.md, reconciler-prompt.md
 ├── scripts/runtime.py, digest.py, miner_contract.py
+├── scripts/workflow_contract.py, reconciliation.py
 ├── scripts/coverage_model.py, ledger.py, verification.py
 ├── scripts/scoring.py, apply.py, evaluate.py
 ├── scripts/install.py, reflect_setup.py
 ├── scripts/test_*.py
-└── fixtures/evaluation/
+├── fixtures/evaluation/
+└── evals/evals.json
 ```
 
-Local manifests, scratch digests, reports, notes, and ledgers contain
+Local manifests, scratch digests, plans, reports, notes, and ledgers contain
 session-derived data and remain uncommitted.

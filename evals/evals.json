@@ -1,0 +1,77 @@
+{
+  "skill_name": "reflect-setup",
+  "evals": [
+    {
+      "id": "synonym-merge",
+      "prompt": "Run reflect-setup over the committed semantic corpus (fixtures/evaluation/semantic) and reconcile the two sessions that describe the same patch-context failure under different proposed keys. Expect exactly one final candidate containing both finding IDs and both evidence references.",
+      "expected_output": "One final candidate cluster for the patch-context failure that merges the two synonym-named findings, with both finding IDs in the reconciliation partition and both original evidence references preserved.",
+      "files": ["fixtures/evaluation/semantic"],
+      "expectations": [
+        {
+          "name": "synonym-merge-single-candidate",
+          "text": "The final ranked candidates contain exactly one cluster for the patch-context failure.",
+          "passed": false,
+          "evidence": ""
+        },
+        {
+          "name": "synonym-merge-both-findings",
+          "text": "The merged candidate contains both finding IDs from the two sessions.",
+          "passed": false,
+          "evidence": ""
+        },
+        {
+          "name": "synonym-merge-both-evidence",
+          "text": "The merged candidate preserves both original evidence references.",
+          "passed": false,
+          "evidence": ""
+        }
+      ]
+    },
+    {
+      "id": "cause-preservation",
+      "prompt": "Run reflect-setup over the committed semantic corpus (fixtures/evaluation/semantic) where two sessions share a generic build-failure symptom but the supplied paraphrases identify different causes. Expect two separate candidates and a complete one-to-one reconciliation partition.",
+      "expected_output": "Two final candidates (missing dependency, stale build cache) with a complete one-to-one reconciliation partition that never merges the two different causes.",
+      "files": ["fixtures/evaluation/semantic"],
+      "expectations": [
+        {
+          "name": "cause-preservation-two-candidates",
+          "text": "The final ranked candidates contain two separate clusters for the two different build-failure causes.",
+          "passed": false,
+          "evidence": ""
+        },
+        {
+          "name": "cause-preservation-partition",
+          "text": "The reconciliation partition is complete and one-to-one: every finding ID appears exactly once.",
+          "passed": false,
+          "evidence": ""
+        }
+      ]
+    },
+    {
+      "id": "preview-only-apply",
+      "prompt": "Run reflect-setup with --apply and a host input that approves one fixture cluster with request and workspace inputs but no proof. Expect the run to stop at apply-preview with a bounded preview and byte-identical target files before and after the run.",
+      "expected_output": "The run reports stage apply-preview, creates a bounded preview for the approved cluster, and never modifies the target project files.",
+      "files": ["fixtures/evaluation/semantic"],
+      "expectations": [
+        {
+          "name": "preview-only-stage",
+          "text": "The run stops at apply-preview and never reaches apply-validated without a proof.",
+          "passed": false,
+          "evidence": ""
+        },
+        {
+          "name": "preview-only-bounded",
+          "text": "The preview is bounded to the approved target paths and commands.",
+          "passed": false,
+          "evidence": ""
+        },
+        {
+          "name": "preview-only-no-execution",
+          "text": "Target project files are byte-identical before and after the run.",
+          "passed": false,
+          "evidence": ""
+        }
+      ]
+    }
+  ]
+}

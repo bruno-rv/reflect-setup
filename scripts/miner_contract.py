@@ -264,7 +264,13 @@ def _matching_index_entries(
     return kind_entries
 
 
-def _normalize_cluster_key(value: str) -> str:
+def normalize_cluster_key(value: str) -> str:
+    """Normalize a proposed cluster key without changing its meaning.
+
+    Trims surrounding whitespace, collapses internal whitespace runs, and
+    casefolds. This is the shared identity used for finding IDs and
+    reconciliation; it is not a kebab-slug rewrite.
+    """
     return re.sub(r"\s+", " ", value.strip()).casefold()
 
 
@@ -360,7 +366,7 @@ def _parse_finding(
     value = _strict_object(raw, f"findings[{index}]")
     _exact_fields(value, _FINDING_FIELDS, f"findings[{index}]")
     cluster_key = _non_empty_string(value["cluster_key"], "finding.cluster_key")
-    if not _normalize_cluster_key(cluster_key):
+    if not normalize_cluster_key(cluster_key):
         _fail("finding.cluster_key must be non-empty")
     finding_type_value = value["finding_type"]
     if not isinstance(finding_type_value, str):
@@ -646,7 +652,7 @@ def merge_reports(reports: tuple[MinerReport, ...] | list[MinerReport], manifest
     for report in report_values:
         for finding in report.findings:
             key = (
-                _normalize_cluster_key(finding.cluster_key),
+                normalize_cluster_key(finding.cluster_key),
                 finding.finding_type,
                 finding.session_id,
             )
@@ -663,7 +669,7 @@ def merge_reports(reports: tuple[MinerReport, ...] | list[MinerReport], manifest
                 min((ref.timestamp, ref.digest_path, ref.source_line) for ref in item.evidence),
                 item.session_id,
                 item.finding_type.value,
-                _normalize_cluster_key(item.paraphrase),
+                normalize_cluster_key(item.paraphrase),
                 item.occurrence_count,
                 tuple(sorted(_evidence_key(ref) for ref in item.evidence)),
             ),
@@ -702,7 +708,7 @@ def merge_reports(reports: tuple[MinerReport, ...] | list[MinerReport], manifest
             _fail(f"finding cluster has no evidence: {normalized_key}")
         representative = min(
             findings,
-            key=lambda item: (_normalize_cluster_key(item.paraphrase), len(item.paraphrase), item.paraphrase),
+            key=lambda item: (normalize_cluster_key(item.paraphrase), len(item.paraphrase), item.paraphrase),
         )
         merged.append(
             (
@@ -733,5 +739,6 @@ __all__ = [
     "MinerReport",
     "ReportValidationError",
     "merge_reports",
+    "normalize_cluster_key",
     "parse_report",
 ]

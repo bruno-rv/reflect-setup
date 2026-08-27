@@ -1,0 +1,2 @@
+{"type":"user","timestamp":"2026-08-23T12:00:00Z","message":{"role":"user","content":"The build failed because the dependency is missing."}}
+{"type":"user","timestamp":"2026-08-23T12:01:00Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"build-tool-c","is_error":true,"content":"ModuleNotFoundError: No module named 'requests'"}]}}

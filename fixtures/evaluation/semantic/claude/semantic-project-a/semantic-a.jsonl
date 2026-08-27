@@ -1,0 +1,3 @@
+{"type":"user","timestamp":"2026-08-23T10:00:00Z","message":{"role":"user","content":"The patch failed to apply again: context mismatch on the retry hook."}}
+{"type":"user","timestamp":"2026-08-23T10:01:00Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"patch-tool-a","is_error":true,"content":"patch command failed: context does not match"}]}}
+{"type":"user","timestamp":"2026-08-23T10:02:00Z","message":{"role":"user","content":"This is the third time the patch context drifted."}}

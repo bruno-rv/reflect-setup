@@ -1,0 +1,2 @@
+{"type":"user","timestamp":"2026-08-23T17:00:00Z","message":{"role":"user","content":"Subagent sidechain signal for include_subagents."}}
+{"type":"user","timestamp":"2026-08-23T17:01:00Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"sub-tool","is_error":true,"content":"subagent tool failed"}]}}

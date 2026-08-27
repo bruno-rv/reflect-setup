@@ -42,13 +42,21 @@ from digest import (
 )
 from ledger import LedgerStatus, parse_ledger
 from miner_contract import (
-    BatchSpec,
     EvidenceRef,
     Finding,
     MinerReport,
     ReportValidationError,
     parse_report,
     merge_reports,
+)
+from reconciliation import (
+    ReconciliationReport,
+    ReconciliationRequest,
+    build_request,
+    finding_id,
+    parse_report as parse_reconciliation_report,
+    parse_request as parse_reconciliation_request,
+    validate_groups,
 )
 from runtime import (
     Runtime,
@@ -60,6 +68,14 @@ from runtime import (
 )
 from scoring import CandidateScore, compute_metrics, rank_candidates, score_candidate
 from verification import FixVerification, verify_fix
+from workflow_contract import (
+    ApplyInput,
+    DispatchBatch,
+    DispatchPlan,
+    HostInput,
+    RunStage,
+    WorkspaceBinding,
+)
 
 
 UTC = timezone.utc
@@ -81,11 +97,16 @@ class ApplyApprovalError(ValueError):
 @_frozen_dataclass
 class ReflectionRun:
     manifest: DigestManifest
-    report_path: Path
+    stage: RunStage
+    report_path: Path | None
     ranked_candidates: tuple[CandidateScore, ...]
     coverage: tuple[CoverageRecord, ...]
     apply_preview: ApplyPreview | None
     apply_previews: tuple[ApplyPreview, ...] = ()
+    dispatch_plan_path: Path | None = None
+    reconciliation_request_path: Path | None = None
+    manifest_path: Path | None = None
+    missing_paths: tuple[Path, ...] = ()
 
 
 def _utc(value: datetime) -> datetime:
@@ -606,45 +627,225 @@ def _coverage(
     return tuple(records)
 
 
-def _report_metadata(raw: str, path: Path) -> BatchSpec:
-    try:
-        value = json.loads(raw)
-    except (json.JSONDecodeError, TypeError, ValueError) as exc:
-        raise ReportValidationError(f"miner report {path} is not valid JSON: {exc}") from exc
-    if not isinstance(value, dict):
-        raise ReportValidationError(f"miner report {path} must contain one JSON object")
-    batch_id = value.get("batch_id")
-    digest_paths = value.get("digest_paths")
-    if not isinstance(batch_id, str) or not batch_id.strip():
-        raise ReportValidationError(f"miner report {path} has no batch_id")
-    if not isinstance(digest_paths, list) or any(
-        not isinstance(item, str) or not item.strip() for item in digest_paths
-    ):
-        raise ReportValidationError(f"miner report {path} has invalid digest_paths")
-    return BatchSpec(batch_id, tuple(digest_paths))
-
-
-def _load_reports(paths: tuple[Path, ...], manifest: DigestManifest) -> tuple[MinerReport, ...]:
-    if not paths:
-        if _manifest_digest_paths(manifest):
+def _build_dispatch_plan(
+    manifest: DigestManifest,
+    out_dir: Path,
+    miner_batch_count: int,
+) -> DispatchPlan:
+    """Partition non-empty digest paths into byte-balanced batches."""
+    if isinstance(miner_batch_count, bool) or not isinstance(miner_batch_count, int):
+        raise TypeError("miner_batch_count must be an integer")
+    if miner_batch_count < 1:
+        raise ValueError("miner_batch_count must be at least 1")
+    run_root = out_dir.expanduser().resolve(strict=False)
+    digest_paths = _manifest_digest_paths(manifest)
+    if not digest_paths:
+        raise ReportValidationError("manifest has no digest paths to dispatch")
+    sized = []
+    for raw_path in digest_paths:
+        path = _continuation_path(raw_path, out_dir)
+        try:
+            path.relative_to(run_root)
+        except ValueError as exc:
             raise ReportValidationError(
-                "manifest has digest paths but no miner reports cover them"
+                f"digest path escapes run directory: {raw_path}"
+            ) from exc
+        if not path.is_file():
+            raise ReportValidationError(f"digest is missing from manifest: {raw_path}")
+        sized.append((path.stat().st_size, raw_path))
+    sized.sort(key=lambda item: (-item[0], item[1]))
+    batch_count = min(miner_batch_count, len(sized))
+    loads = [0] * batch_count
+    batches: list[list[str]] = [[] for _ in range(batch_count)]
+    for size, raw_path in sized:
+        target = min(range(batch_count), key=lambda index: (loads[index], index))
+        loads[target] += size
+        batches[target].append(raw_path)
+    plan_batches = []
+    for index, paths in enumerate(batches, 1):
+        batch_id = f"batch-{index:03d}"
+        ordered = tuple(sorted(paths))
+        report_path = str((run_root / "miner-reports" / f"{batch_id}.json").resolve(strict=False))
+        total_bytes = sum(
+            _continuation_path(path, out_dir).stat().st_size for path in ordered
+        )
+        plan_batches.append(
+            DispatchBatch(batch_id, ordered, report_path, total_bytes)
+        )
+    return DispatchPlan(1, manifest.runtime, manifest.run_id, _sha256(run_root / "manifest.json"), tuple(plan_batches))
+
+
+def _load_dispatch_plan(out_dir: Path) -> DispatchPlan | None:
+    path = out_dir / "dispatch-plan.json"
+    if not path.is_file():
+        return None
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ReportValidationError(f"cannot read dispatch plan {path}: {exc}") from exc
+    return DispatchPlan.from_json(json.loads(raw), "dispatch plan")
+
+
+def _validate_dispatch_plan(
+    plan: DispatchPlan,
+    manifest: DigestManifest,
+    out_dir: Path,
+    miner_batch_count: int,
+) -> None:
+    """Fail closed unless the persisted plan still matches this run."""
+    if not isinstance(plan, DispatchPlan):
+        raise TypeError("plan must be a DispatchPlan value")
+    if plan.schema_version != 1:
+        raise ReportValidationError("dispatch plan schema_version must be 1")
+    if plan.runtime is not manifest.runtime:
+        raise ReportValidationError("dispatch plan runtime does not match the manifest")
+    if plan.run_id != manifest.run_id:
+        raise ReportValidationError("dispatch plan run_id does not match the manifest")
+    run_root = out_dir.expanduser().resolve(strict=False)
+    manifest_path = run_root / "manifest.json"
+    if plan.manifest_sha256 != _sha256(manifest_path):
+        raise ReportValidationError("dispatch plan manifest hash does not match the manifest")
+    if isinstance(miner_batch_count, bool) or not isinstance(miner_batch_count, int):
+        raise TypeError("miner_batch_count must be an integer")
+    if miner_batch_count < 1:
+        raise ValueError("miner_batch_count must be at least 1")
+    expected_count = min(miner_batch_count, len(_manifest_digest_paths(manifest)))
+    if len(plan.batches) != expected_count:
+        raise ReportValidationError(
+            "dispatch plan batch count does not match --miner-batches"
+        )
+    expected_paths = set(_manifest_digest_paths(manifest))
+    planned_paths: set[str] = set()
+    for batch in plan.batches:
+        if not isinstance(batch, DispatchBatch):
+            raise TypeError("plan batches must contain DispatchBatch values")
+        if not batch.batch_id.startswith("batch-"):
+            raise ReportValidationError(f"unexpected batch id: {batch.batch_id}")
+        if len(set(batch.digest_paths)) != len(batch.digest_paths):
+            raise ReportValidationError(f"batch {batch.batch_id} contains duplicate digest paths")
+        for raw_path in batch.digest_paths:
+            if raw_path not in expected_paths:
+                raise ReportValidationError(
+                    f"batch {batch.batch_id} digest path is not in the manifest: {raw_path}"
+                )
+            if raw_path in planned_paths:
+                raise ReportValidationError(
+                    f"digest path appears in more than one batch: {raw_path}"
+                )
+            planned_paths.add(raw_path)
+        report_path = Path(batch.report_path)
+        if not report_path.is_absolute():
+            raise ReportValidationError(
+                f"batch {batch.batch_id} report path must be absolute"
             )
-        return ()
-    if not _manifest_digest_paths(manifest):
-        raise ReportValidationError("miner reports were supplied but the manifest has no digest paths")
-    if len(set(paths)) != len(paths):
-        raise ReportValidationError("miner report paths must not contain duplicates")
+        try:
+            report_path.relative_to(run_root)
+        except ValueError as exc:
+            raise ReportValidationError(
+                f"batch {batch.batch_id} report path escapes the run directory"
+            ) from exc
+        if report_path.parent != (run_root / "miner-reports"):
+            raise ReportValidationError(
+                f"batch {batch.batch_id} report path is outside miner-reports/"
+            )
+        if report_path.name != f"{batch.batch_id}.json":
+            raise ReportValidationError(
+                f"batch {batch.batch_id} report path does not match its batch id"
+            )
+        total_bytes = 0
+        for raw_path in batch.digest_paths:
+            digest_path = _continuation_path(raw_path, out_dir)
+            if not digest_path.is_file():
+                raise ReportValidationError(
+                    f"digest is missing from manifest: {raw_path}"
+                )
+            total_bytes += digest_path.stat().st_size
+        if batch.total_bytes != total_bytes:
+            raise ReportValidationError(
+                f"batch {batch.batch_id} byte total does not match current digest sizes"
+            )
+    missing = sorted(expected_paths - planned_paths)
+    if missing:
+        raise ReportValidationError(
+            "dispatch plan does not cover digest paths: " + ", ".join(missing)
+        )
+    reports_dir = run_root / "miner-reports"
+    if reports_dir.is_dir():
+        planned_names = {Path(batch.report_path).name for batch in plan.batches}
+        for path in sorted(reports_dir.iterdir()):
+            if not path.is_file() or path.name.startswith("."):
+                continue
+            if path.name not in planned_names:
+                raise ReportValidationError(
+                    f"unplanned file in miner-reports/: {path.name}"
+                )
+
+
+def _load_plan_reports(
+    plan: DispatchPlan,
+    manifest: DigestManifest,
+    out_dir: Path,
+) -> tuple[MinerReport, ...]:
+    """Read and validate every report at its prescribed path."""
     reports: list[MinerReport] = []
-    for path in paths:
-        path = Path(path).expanduser()
+    for batch in plan.batches:
+        path = Path(batch.report_path)
+        if not path.is_file():
+            raise ReportValidationError(f"miner report is missing: {path}")
         try:
             raw = path.read_text(encoding="utf-8")
         except OSError as exc:
             raise ReportValidationError(f"cannot read miner report {path}: {exc}") from exc
-        batch = _report_metadata(raw, path)
+        try:
+            value = json.loads(raw)
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise ReportValidationError(f"miner report {path} is not valid JSON: {exc}") from exc
+        if not isinstance(value, dict):
+            raise ReportValidationError(f"miner report {path} must contain one JSON object")
+        batch_id = value.get("batch_id")
+        digest_paths = value.get("digest_paths")
+        if not isinstance(batch_id, str) or not batch_id.strip():
+            raise ReportValidationError(f"miner report {path} has no batch_id")
+        if not isinstance(digest_paths, list) or any(
+            not isinstance(item, str) or not item.strip() for item in digest_paths
+        ):
+            raise ReportValidationError(f"miner report {path} has invalid digest_paths")
+        if batch_id != batch.batch_id:
+            raise ReportValidationError(
+                f"miner report {path} batch_id does not match its assigned batch"
+            )
+        if tuple(digest_paths) != batch.digest_paths:
+            raise ReportValidationError(
+                f"miner report {path} digest_paths do not match its assigned batch"
+            )
         reports.append(parse_report(raw, manifest, batch))
     return tuple(reports)
+
+
+def _load_reconciliation(
+    out_dir: Path,
+    manifest: DigestManifest,
+) -> ReconciliationReport | None:
+    path = out_dir / "reconciliation-report.json"
+    if not path.is_file():
+        return None
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ReportValidationError(f"cannot read reconciliation report {path}: {exc}") from exc
+    request_path = out_dir / "reconciliation-request.json"
+    try:
+        request_raw = request_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ReportValidationError(
+            f"cannot read reconciliation request {request_path}: {exc}"
+        ) from exc
+    request = parse_reconciliation_request(request_raw)
+    if request.runtime is not manifest.runtime:
+        raise ReportValidationError("reconciliation request runtime does not match the manifest")
+    if request.run_id != manifest.run_id:
+        raise ReportValidationError("reconciliation request run_id does not match the manifest")
+    return parse_reconciliation_report(raw, request)
 
 
 def _group_findings(findings: Iterable[Finding]) -> dict[str, tuple[Finding, ...]]:
@@ -764,23 +965,24 @@ def _proof_map(values: Any) -> dict[str, FixProof]:
     return result
 
 
-def _rank(
-    findings: tuple[Finding, ...],
+def _rank_grouped(
+    grouped: Mapping[str, tuple[Finding, ...]],
     analyzed_sessions: int,
     regression_counts: Mapping[str, int] | None = None,
 ) -> tuple[CandidateScore, ...]:
     regression_counts = regression_counts or {}
     candidates: list[CandidateScore] = []
-    for cluster_key, cluster_findings in _group_findings(findings).items():
-        confidence = max(finding.confidence for finding in cluster_findings)
+    for cluster_key, cluster_findings in grouped.items():
         metrics = compute_metrics(
             cluster_findings,
             analyzed_sessions,
             regression_count=regression_counts.get(_cluster_id(cluster_key), 0),
-            confidence=confidence,
-            implementation_cost="M",
         )
-        candidates.append(score_candidate(cluster_key, metrics))
+        summary = min(
+            (finding.paraphrase for finding in cluster_findings),
+            key=lambda value: (len(value), value),
+        )
+        candidates.append(score_candidate(cluster_key, summary, cluster_findings, metrics))
     return rank_candidates(candidates)
 
 
@@ -904,6 +1106,33 @@ def _report_payload(
     }
 
 
+def _apply_inputs(
+    host_input: HostInput | None,
+    apply: bool,
+) -> tuple[tuple[str, ...], dict[str, ApplyRequest], dict[str, WorkspaceState], dict[str, FixProof]]:
+    """Extract and normalize Apply inputs from the strict host input."""
+    if host_input is None or host_input.apply is None:
+        if apply:
+            raise ApplyApprovalError("Apply requires a host input with an apply object")
+        return (), {}, {}, {}
+    apply_input = host_input.apply
+    if not apply:
+        raise ApplyApprovalError("--apply is required when the host input contains an apply object")
+    if not apply_input.approved_clusters:
+        raise ApplyApprovalError("Apply requires at least one approved cluster")
+    if not apply_input.requests:
+        raise ApplyApprovalError("Apply requires at least one ApplyRequest")
+    if not apply_input.workspaces:
+        raise ApplyApprovalError("Apply requires at least one WorkspaceState")
+    normalized_approvals = _approved_ids(apply_input.approved_clusters)
+    requests = _request_map(apply_input.requests)
+    workspaces = _workspace_map(
+        {binding.cluster_id: binding.workspace for binding in apply_input.workspaces}
+    )
+    proofs = _proof_map(apply_input.proofs)
+    return normalized_approvals, requests, workspaces, proofs
+
+
 def run_reflection(
     *,
     runtime_name: str | None,
@@ -913,12 +1142,9 @@ def run_reflection(
     project_filter: str | None,
     include_subagents: bool,
     out_dir: Path,
-    miner_report_paths: tuple[Path, ...],
-    apply: bool,
-    approved_clusters: tuple[str, ...] = (),
-    apply_requests: Iterable[ApplyRequest] | Mapping[str, ApplyRequest] | None = None,
-    apply_workspaces: Mapping[str, WorkspaceState] | None = None,
-    apply_proofs: Iterable[FixProof] | Mapping[str, FixProof] | None = None,
+    miner_batch_count: int = 8,
+    host_input: HostInput | None = None,
+    apply: bool = False,
     coverage_observations: Iterable[CoverageObservation]
     | Mapping[str, CoverageObservation]
     | None = None,
@@ -929,9 +1155,12 @@ def run_reflection(
 ) -> ReflectionRun:
     """Run one complete reflection pass and write an atomic JSON report.
 
-    The Python core never dispatches a host task or fixer. ``approved_clusters``
-    is only the explicit CLI approval boundary; host workflows own any later
-    Apply preview/execution using ``scripts/apply.py``.
+    The Python core never dispatches a host task or fixer. The persisted
+    dispatch plan and reconciliation request are the replayable handoff
+    artifacts; the host writes miner reports and the reconciliation report at
+    the prescribed paths and reruns the same command. ``--apply`` remains the
+    explicit command-line safety signal, and approvals come only from the
+    strict host-input file.
     """
     if not isinstance(home, Path):
         raise TypeError("home must be a pathlib.Path")
@@ -939,24 +1168,11 @@ def run_reflection(
         raise TypeError("out_dir must be a pathlib.Path")
     if not isinstance(apply, bool):
         raise TypeError("apply must be a bool")
-    approvals = tuple(approved_clusters)
-    if not apply and approvals:
-        raise ApplyApprovalError("--approve-cluster is only valid with --apply")
-    if apply and not approvals:
-        raise ApplyApprovalError("Apply requires explicit cluster approval")
-    if not apply and any(value is not None for value in (apply_requests, apply_workspaces, apply_proofs)):
-        raise ApplyApprovalError("Apply inputs are only valid with --apply")
-    if apply and (apply_requests is None or apply_workspaces is None):
-        raise ApplyApprovalError(
-            "Apply requires matching ApplyRequest and WorkspaceState inputs"
-        )
+    if host_input is not None and not isinstance(host_input, HostInput):
+        raise TypeError("host_input must be a HostInput value")
     if ledger_path is not None and not isinstance(ledger_path, Path):
         raise TypeError("ledger_path must be a pathlib.Path")
-
-    normalized_approvals = _approved_ids(approvals)
-    requests = _request_map(apply_requests) if apply else {}
-    workspaces = _workspace_map(apply_workspaces) if apply else {}
-    proofs = _proof_map(apply_proofs) if apply else {}
+    normalized_approvals, requests, workspaces, proofs = _apply_inputs(host_input, apply)
 
     spec = resolve_runtime(
         runtime_name,
@@ -983,8 +1199,144 @@ def run_reflection(
         _persist_digest_hashes(out_dir, manifest)
     # IncompleteDigestError is intentionally raised by run_digest after the
     # manifest is persisted, and must stop before any miner report is read.
-    reports = _load_reports(tuple(Path(path) for path in miner_report_paths), manifest)
-    findings = merge_reports(reports, manifest) if reports else ()
+
+    run_root = out_dir.expanduser().resolve(strict=False)
+    dispatch_plan_path = run_root / "dispatch-plan.json"
+    plan = _load_dispatch_plan(out_dir)
+    if plan is None:
+        if not _manifest_digest_paths(manifest):
+            # A complete manifest with no signal-bearing digests skips dispatch
+            # and reconciliation entirely.
+            ranked = ()
+            stage = RunStage.DIAGNOSIS_COMPLETE
+            report_path = run_root / "reflection-report.json"
+            inventory = _inventory(spec)
+            coverage = _coverage(inventory, coverage_observations, coverage_records)
+            verification = _verify_ledger((), coverage, ledger_path)
+            _atomic_json(
+                report_path,
+                _json_value(
+                    _report_payload(
+                        manifest,
+                        ranked,
+                        coverage,
+                        verification,
+                        inventory,
+                        apply,
+                        (),
+                        (),
+                        (),
+                        ledger_path,
+                    )
+                ),
+            )
+            return ReflectionRun(
+                manifest,
+                stage,
+                report_path,
+                ranked,
+                coverage,
+                None,
+                (),
+            )
+        plan = _build_dispatch_plan(manifest, out_dir, miner_batch_count)
+        _atomic_json(dispatch_plan_path, plan.to_json())
+        missing = tuple(
+            Path(batch.report_path)
+            for batch in plan.batches
+            if not Path(batch.report_path).is_file()
+        )
+        return ReflectionRun(
+            manifest,
+            RunStage.AWAITING_MINERS,
+            None,
+            (),
+            (),
+            None,
+            (),
+            dispatch_plan_path=dispatch_plan_path,
+            manifest_path=run_root / "manifest.json",
+            missing_paths=missing,
+        )
+    _validate_dispatch_plan(plan, manifest, out_dir, miner_batch_count)
+
+    try:
+        reports = _load_plan_reports(plan, manifest, out_dir)
+    except ReportValidationError:
+        missing = tuple(
+            Path(batch.report_path)
+            for batch in plan.batches
+            if not Path(batch.report_path).is_file()
+        )
+        if missing:
+            return ReflectionRun(
+                manifest,
+                RunStage.AWAITING_MINERS,
+                None,
+                (),
+                (),
+                None,
+                (),
+                dispatch_plan_path=dispatch_plan_path,
+                manifest_path=run_root / "manifest.json",
+                missing_paths=missing,
+            )
+        raise
+    findings = merge_reports(reports, manifest)
+
+    reconciliation_request_path = run_root / "reconciliation-request.json"
+    reconciliation_report_path = run_root / "reconciliation-report.json"
+    if len(findings) > 1 and not reconciliation_report_path.is_file():
+        request = build_request(
+            findings,
+            runtime=manifest.runtime,
+            run_id=manifest.run_id,
+        )
+        _atomic_json(reconciliation_request_path, request.to_json())
+        return ReflectionRun(
+            manifest,
+            RunStage.AWAITING_RECONCILIATION,
+            None,
+            (),
+            (),
+            None,
+            (),
+            dispatch_plan_path=dispatch_plan_path,
+            reconciliation_request_path=reconciliation_request_path,
+            manifest_path=run_root / "manifest.json",
+        )
+
+    grouped: dict[str, tuple[Finding, ...]] = {}
+    if not findings:
+        grouped = {}
+    elif len(findings) == 1:
+        finding = findings[0]
+        grouped = {finding.cluster_key: (finding,)}
+    else:
+        report = _load_reconciliation(out_dir, manifest)
+        if report is None:
+            raise ReportValidationError(
+                "reconciliation report is missing; rerun after the reconciler returns"
+            )
+        request = parse_reconciliation_request(
+            reconciliation_request_path.read_text(encoding="utf-8")
+        )
+        if request.runtime is not manifest.runtime or request.run_id != manifest.run_id:
+            raise ReportValidationError(
+                "reconciliation request does not match this run"
+            )
+        groups = validate_groups(report, request)
+        by_id = {
+            finding_id(finding, manifest.runtime): finding
+            for finding in findings
+        }
+        for group in groups:
+            members = tuple(
+                by_id[finding_id_value]
+                for finding_id_value in group.member_finding_ids
+            )
+            grouped[group.cluster_key] = members
+
     inventory = _inventory(spec)
     coverage = _coverage(inventory, coverage_observations, coverage_records)
     verification = _verify_ledger(findings, coverage, ledger_path)
@@ -993,7 +1345,7 @@ def run_reflection(
         for item in verification
         if item.overall.value == "fail"
     }
-    ranked = _rank(findings, len(_manifest_session_paths(manifest)), regression_counts)
+    ranked = _rank_grouped(grouped, len(_manifest_session_paths(manifest)), regression_counts)
 
     previews: list[ApplyPreview] = []
     validated_proofs: list[str] = []
@@ -1056,7 +1408,14 @@ def run_reflection(
             )
             validated_proofs.append(cluster_id)
 
-    report_path = Path(out_dir) / "reflection-report.json"
+    stage = (
+        RunStage.APPLY_VALIDATED
+        if apply and validated_proofs
+        else RunStage.APPLY_PREVIEW
+        if apply
+        else RunStage.DIAGNOSIS_COMPLETE
+    )
+    report_path = run_root / "reflection-report.json"
     _atomic_json(
         report_path,
         _json_value(
@@ -1077,11 +1436,15 @@ def run_reflection(
     preview_tuple = tuple(previews)
     return ReflectionRun(
         manifest,
+        stage,
         report_path,
         ranked,
         coverage,
         preview_tuple[0] if preview_tuple else None,
         preview_tuple,
+        dispatch_plan_path=dispatch_plan_path,
+        reconciliation_request_path=reconciliation_request_path,
+        manifest_path=run_root / "manifest.json",
     )
 
 
@@ -1093,12 +1456,38 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--project-filter")
     parser.add_argument("--include-subagents", action="store_true")
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--miner-report", type=Path, action="append", default=[])
+    parser.add_argument("--miner-batches", type=int, default=8, metavar="COUNT")
+    parser.add_argument("--host-input", type=Path)
     parser.add_argument("--apply", action="store_true")
-    parser.add_argument("--approve-cluster", action="append", default=[])
     parser.add_argument("--ledger", type=Path)
     parser.add_argument("--json", action="store_true")
     return parser
+
+
+def _status_line(result: ReflectionRun) -> str:
+    return (
+        f"stage={result.stage.value} "
+        f"runtime={result.manifest.runtime.value} "
+        f"run_id={result.manifest.run_id}"
+    )
+
+
+def _json_envelope(result: ReflectionRun) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "stage": result.stage.value,
+        "runtime": result.manifest.runtime.value,
+        "run_id": result.manifest.run_id,
+        "manifest_path": str(result.manifest_path) if result.manifest_path else None,
+        "dispatch_plan_path": str(result.dispatch_plan_path) if result.dispatch_plan_path else None,
+        "reconciliation_request_path": (
+            str(result.reconciliation_request_path)
+            if result.reconciliation_request_path
+            else None
+        ),
+        "report_path": str(result.report_path) if result.report_path else None,
+        "missing_paths": [str(path) for path in result.missing_paths],
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1106,12 +1495,15 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.since < 0:
         parser.error("--since must be non-negative")
-    if args.approve_cluster and not args.apply:
-        print("reflect-setup: --approve-cluster is only valid with --apply", file=sys.stderr)
-        return 2
-    if args.apply and not args.approve_cluster:
-        print("reflect-setup: Apply requires explicit cluster approval", file=sys.stderr)
-        return 2
+    if args.miner_batches < 1:
+        parser.error("--miner-batches must be at least 1")
+    host_input = None
+    if args.host_input is not None:
+        try:
+            host_input = HostInput.parse(args.host_input.read_text(encoding="utf-8"))
+        except (OSError, ReportValidationError) as exc:
+            print(f"reflect-setup: {exc}", file=sys.stderr)
+            return 2
     since = datetime.now(UTC) - timedelta(days=args.since)
     try:
         result = run_reflection(
@@ -1122,24 +1514,25 @@ def main(argv: list[str] | None = None) -> int:
             project_filter=args.project_filter,
             include_subagents=args.include_subagents,
             out_dir=args.out,
-            miner_report_paths=tuple(args.miner_report),
+            miner_batch_count=args.miner_batches,
+            host_input=host_input,
             apply=args.apply,
-            approved_clusters=tuple(args.approve_cluster),
             ledger_path=args.ledger,
         )
     except (ApplyApprovalError, IncompleteDigestError, ReportValidationError, OSError, RuntimeError, ValueError) as exc:
         print(f"reflect-setup: {exc}", file=sys.stderr)
         return 2
     if args.json:
-        print(result.report_path.read_text(encoding="utf-8"), end="")
+        print(json.dumps(_json_envelope(result), sort_keys=True, indent=2))
     else:
-        print(
-            f"runtime={result.manifest.runtime.value} "
-            f"sessions={result.manifest.sessions_scanned} "
-            f"signals={result.manifest.sessions_with_signals} "
-            f"candidates={len(result.ranked_candidates)} "
-            f"report={result.report_path}"
-        )
+        print(_status_line(result))
+        if result.stage is RunStage.AWAITING_MINERS:
+            for path in result.missing_paths:
+                print(f"missing={path}")
+        elif result.stage is RunStage.AWAITING_RECONCILIATION:
+            print(f"reconciliation_request={result.reconciliation_request_path}")
+        elif result.report_path is not None:
+            print(f"report={result.report_path}")
     return 0
 
 
