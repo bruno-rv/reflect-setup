@@ -4,3 +4,4 @@ clusters.yaml
 .reflect-setup-run-*/
 __pycache__/
 .remember/
+fixes/artifacts/
